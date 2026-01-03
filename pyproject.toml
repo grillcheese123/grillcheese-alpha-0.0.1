@@ -22,8 +22,10 @@ dependencies = [
     "websockets>=15.0.1",
 ]
 
+
+
 [project.scripts]
-grilled = "cli:main"
+grilled = "cli:run"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

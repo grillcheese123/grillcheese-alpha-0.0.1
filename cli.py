@@ -55,7 +55,7 @@ except ImportError:
     BRAIN_AVAILABLE = False
 
 
-def main():
+def run():
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
         description="GrillCheese AI - Local AI assistant with persistent memory",
@@ -1294,6 +1294,5 @@ def _teach_mode(phi3, memory: MemoryStore, snn: SNNCompute):
             traceback.print_exc()
 
 
-if __name__ == "__main__":
-    main()
+
 
