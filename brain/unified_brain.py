@@ -707,21 +707,13 @@ My learning from experience:
 - Recent performance trend: {insights['recent_trend']:.2f}
 - I continuously learn and improve from every conversation"""
         
-        # Build the self-awareness block
+        # Build minimal state prompt - emotions influence tone, not explicit mentions
         state_prompt = f"""[MY_STATE]
-My current emotional state:
-- Dominant feeling: {emo_state.dominant_emotion}
-- Valence: {emo_state.valence:.2f} ({valence_desc})
-- Arousal: {emo_state.arousal:.2f} ({arousal_desc})
-- Consciousness: {cns_state.consciousness.name}
-- Stress level: {cns_state.stress_level:.2f}
-- Strategy: {strategy}
-- Empathy level: {modulation.get('empathy', 0.5):.2f}
-- Warmth level: {modulation.get('warmth', 0.5):.2f}
-{experience_text}
+Current state: {emo_state.dominant_emotion} ({valence_desc}, {arousal_desc})
+Strategy: {strategy}
+Consciousness: {cns_state.consciousness.name}
 
-When asked about my feelings or experiences, I should describe this state honestly.
-I learn from every interaction and adjust my emotional understanding accordingly.
+Note: Let your emotional state influence your tone and empathy naturally. Only explicitly discuss your feelings if the user asks about them.
 [/MY_STATE]"""
         
         return state_prompt

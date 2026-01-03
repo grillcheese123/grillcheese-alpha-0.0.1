@@ -55,11 +55,11 @@ class ModelConfig:
     ]
     
     # Generation settings
-    MAX_NEW_TOKENS_GPU = 100
-    MAX_NEW_TOKENS_CPU = 50
+    MAX_NEW_TOKENS_GPU = 256
+    MAX_NEW_TOKENS_CPU = 128
     TEMPERATURE = 0.7
     TOP_P = 0.9
-    MAX_CONTEXT_ITEMS = 3
+    MAX_CONTEXT_ITEMS = 5
 
 
 # Memory configuration

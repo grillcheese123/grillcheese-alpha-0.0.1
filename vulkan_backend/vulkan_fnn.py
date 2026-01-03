@@ -155,54 +155,74 @@ class VulkanFNN:
         return result.reshape(input_data.shape) if input_data.ndim > 1 else result
     
     def activation_softmax(self, input_data, axis=-1):
-        """Apply softmax activation"""
+        """
+        Apply softmax activation: exp(x) / sum(exp(x))
+        
+        Args:
+            input_data: Input array
+            axis: Axis along which to compute softmax (default: -1)
+        
+        Returns:
+            Softmax probabilities
+        """
         data = input_data.astype(np.float32)
         original_shape = data.shape
         
-        if axis == -1:
-            axis = len(data.shape) - 1
-        
-        # Flatten for processing
-        if data.ndim > 1:
-            # Reshape to (batch, features) for 2D, or flatten for 1D
-            if data.ndim == 2:
-                batch_size, feature_dim = data.shape
-                data_flat = data.flatten()
-            else:
-                # For higher dimensions, flatten last axis
-                batch_size = int(np.prod(data.shape[:-1]))
-                feature_dim = data.shape[-1]
-                data_flat = data.reshape(-1, feature_dim).flatten()
+        # Handle different input shapes - shader expects (batch, seq_len, features)
+        if data.ndim == 1:
+            batch_size, seq_len, features = 1, 1, len(data)
+            data = data.reshape(1, 1, -1)
+        elif data.ndim == 2:
+            batch_size, seq_len, features = data.shape[0], 1, data.shape[1]
+            data = data.reshape(data.shape[0], 1, -1)
         else:
-            batch_size = 1
-            feature_dim = len(data)
-            data_flat = data.flatten()
+            batch_size, seq_len, features = data.shape
         
-        total_elements = len(data_flat)
+        data_flat = data.flatten()
         
-        # Create buffers
+        # Create buffers - shader needs 4 buffers: input, output, max_vals, sum_exp
         buf_in, mem_in = self.core._create_buffer(data_flat.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
         buf_out, mem_out = self.core._create_buffer(data_flat.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_max, mem_max = self.core._create_buffer(batch_size * seq_len * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_sum, mem_sum = self.core._create_buffer(batch_size * seq_len * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
         
         # Upload data
         self.core._upload_buffer(buf_in, mem_in, data_flat)
         
-        # Get or create pipeline
+        # Get or create pipeline - 4 buffers, 24 bytes push constants (5 uints + padding)
         pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
-            'activation-softmax', 2, push_constant_size=8
+            'activation-softmax', 4, push_constant_size=24
         )
-        
-        # Pack push constants: batch_size, feature_dim
-        push_constants = struct.pack('II', batch_size, feature_dim)
         
         # Get cached descriptor set
         descriptor_set = self.pipelines.get_cached_descriptor_set(
             'activation-softmax',
-            [(buf_in, data_flat.nbytes), (buf_out, data_flat.nbytes)]
+            [
+                (buf_in, data_flat.nbytes),
+                (buf_out, data_flat.nbytes),
+                (buf_max, batch_size * seq_len * 4),
+                (buf_sum, batch_size * seq_len * 4)
+            ]
         )
         
-        # Dispatch
-        workgroups = (batch_size + 255) // 256
+        # Pass 1: Compute max for numerical stability
+        push_constants = struct.pack('IIIII', batch_size, seq_len, features, 0, features)
+        workgroups = ((batch_size * seq_len) + 255) // 256
+        self.core._dispatch_compute(
+            pipeline, pipeline_layout, descriptor_set,
+            workgroups, push_constants
+        )
+        
+        # Pass 2: Compute sum of exponentials
+        push_constants = struct.pack('IIIII', batch_size, seq_len, features, 1, features)
+        self.core._dispatch_compute(
+            pipeline, pipeline_layout, descriptor_set,
+            workgroups, push_constants
+        )
+        
+        # Pass 3: Normalize
+        push_constants = struct.pack('IIIII', batch_size, seq_len, features, 2, features)
+        workgroups = (len(data_flat) + 255) // 256
         self.core._dispatch_compute(
             pipeline, pipeline_layout, descriptor_set,
             workgroups, push_constants
@@ -210,14 +230,17 @@ class VulkanFNN:
         
         # Download results
         result = self.core._download_buffer(mem_out, data_flat.nbytes, dtype=np.float32)
-        result = result[:total_elements]
+        result = result[:len(data_flat)].reshape(original_shape)
         
         # Cleanup
         vkDestroyBuffer(self.core.device, buf_in, None)
         vkDestroyBuffer(self.core.device, buf_out, None)
+        vkDestroyBuffer(self.core.device, buf_max, None)
+        vkDestroyBuffer(self.core.device, buf_sum, None)
         vkFreeMemory(self.core.device, mem_in, None)
         vkFreeMemory(self.core.device, mem_out, None)
+        vkFreeMemory(self.core.device, mem_max, None)
+        vkFreeMemory(self.core.device, mem_sum, None)
         
-        # Reshape to original shape
-        return result.reshape(original_shape)
+        return result
 

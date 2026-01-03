@@ -4,7 +4,10 @@ Uses sentence-transformers for proper semantic embeddings
 """
 import logging
 import numpy as np
+import sys
+import os
 from typing import List, Optional
+from contextlib import contextmanager
 
 from config import ModelConfig, LogConfig, find_gguf_model
 
@@ -27,13 +30,28 @@ except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 
+@contextmanager
+def suppress_llama_output():
+    """Suppress llama.cpp debug output to stderr"""
+    stderr_fileno = sys.stderr.fileno()
+    old_stderr = os.dup(stderr_fileno)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, stderr_fileno)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        os.dup2(old_stderr, stderr_fileno)
+        os.close(old_stderr)
+
+
 class Phi3GGUF:
     """
     Phi-3 model using GGUF format with llama-cpp-python
     Uses sentence-transformers for semantic embeddings (required for memory retrieval)
     """
     
-    def __init__(self, model_path: Optional[str] = "models\Phi-3-mini-4k-instruct-q4.gguf", n_gpu_layers: int = -1):
+    def __init__(self, model_path: Optional[str] = r"models\Phi-3-mini-4k-instruct-q4.gguf", n_gpu_layers: int = -1):
         """
         Initialize Phi-3 GGUF model
         
@@ -68,6 +86,7 @@ class Phi3GGUF:
                 n_gpu_layers=n_gpu_layers,
                 verbose=False,
                 n_threads=4 if n_gpu_layers == 0 else None,
+                logits_all=False,  # Suppress debug output
             )
             gpu_info = "all" if n_gpu_layers < 0 else str(n_gpu_layers)
             logger.info(f"{LogConfig.CHECK} GGUF model loaded (GPU layers: {gpu_info})")
@@ -171,14 +190,16 @@ class Phi3GGUF:
             full_prompt = f"User: {prompt}\nAssistant:"
         
         try:
-            output = self.llm(
-                full_prompt,
-                max_tokens=ModelConfig.MAX_NEW_TOKENS_GPU,
-                temperature=ModelConfig.TEMPERATURE,
-                top_p=ModelConfig.TOP_P,
-                stop=["User:", "\nUser:", "<|end|>", "<|endoftext|>", "</s>"],
-                echo=False,
-            )
+            # Suppress llama-cpp debug output
+            with suppress_llama_output():
+                output = self.llm(
+                    full_prompt,
+                    max_tokens=ModelConfig.MAX_NEW_TOKENS_GPU,
+                    temperature=ModelConfig.TEMPERATURE,
+                    top_p=ModelConfig.TOP_P,
+                    stop=["User:", "\nUser:", "\n\nUser:", "Instruction>", "[MY_STATE]", "<|end|>", "<|endoftext|>", "</s>"],
+                    echo=False,
+                )
             
             # Extract text from response
             if isinstance(output, dict):
@@ -189,12 +210,13 @@ class Phi3GGUF:
             else:
                 response = str(output)
             
-            # Clean up response
+            # Clean up response - remove system prompt echoes
             response = response.strip()
-            if "\nUser:" in response:
-                response = response.split("\nUser:")[0].strip()
-            if "\n\nUser:" in response:
-                response = response.split("\n\nUser:")[0].strip()
+            
+            # Stop at common separators
+            for separator in ["\nUser:", "\n\nUser:", "User:", "Instruction>", "[MY_STATE]", "\nYou are", "\n\nYou are"]:
+                if separator in response:
+                    response = response.split(separator)[0].strip()
             
             return response
             

@@ -95,19 +95,25 @@ class MemoryStore:
                 access_count INTEGER DEFAULT 0,
                 last_accessed TEXT,
                 metadata TEXT,
-                is_identity INTEGER DEFAULT 0
+                is_identity INTEGER DEFAULT 0,
+                is_protected INTEGER DEFAULT 0
             )
         """)
         
-        # Add is_identity column if it doesn't exist (for existing databases)
-        try:
-            cursor.execute("ALTER TABLE memories ADD COLUMN is_identity INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        # Add columns if they don't exist (for existing databases)
+        for column, default in [
+            ("is_identity", "INTEGER DEFAULT 0"),
+            ("is_protected", "INTEGER DEFAULT 0")
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE memories ADD COLUMN {column} {default}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         
         # Indexes for faster queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_identity ON memories(is_identity)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_protected ON memories(is_protected)")
         
         conn.commit()
         conn.close()
@@ -246,7 +252,7 @@ class MemoryStore:
         self.identity_text = identity_text
         logger.info(f"{LogConfig.CHECK} Identity stored at index {write_index}")
     
-    def store(self, embedding: np.ndarray, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def store(self, embedding: np.ndarray, text: str, metadata: Optional[Dict[str, Any]] = None, is_protected: bool = False) -> None:
         """
         Store a new memory using GPU shaders with atomic operations.
         
@@ -254,6 +260,7 @@ class MemoryStore:
             embedding: Embedding vector (embedding_dim,)
             text: Associated text content
             metadata: Optional metadata dictionary
+            is_protected: If True, memory will never be pruned
         """
         if len(embedding) != self.embedding_dim:
             raise ValueError(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
@@ -300,9 +307,9 @@ class MemoryStore:
         
         try:
             cursor.execute("""
-                INSERT INTO memories (embedding, text, timestamp, metadata, is_identity)
-                VALUES (?, ?, ?, ?, 0)
-            """, (embedding_blob, text, timestamp, metadata_json))
+                INSERT INTO memories (embedding, text, timestamp, metadata, is_identity, is_protected)
+                VALUES (?, ?, ?, ?, 0, ?)
+            """, (embedding_blob, text, timestamp, metadata_json, 1 if is_protected else 0))
             
             conn.commit()
         except Exception as e:
@@ -564,11 +571,22 @@ class MemoryStore:
             with self._stats_lock:
                 self._flush_stats_batch()
     
-    def clear(self) -> None:
-        """Clear all memories (use with caution!)"""
+    def clear(self, include_protected: bool = False) -> None:
+        """
+        Clear all memories (use with caution!)
+        
+        Args:
+            include_protected: If True, also delete protected memories. Default False.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM memories")
+        
+        if include_protected:
+            cursor.execute("DELETE FROM memories")
+        else:
+            # Preserve protected memories and identity
+            cursor.execute("DELETE FROM memories WHERE is_protected = 0 AND is_identity = 0")
+        
         conn.commit()
         conn.close()
         
@@ -578,10 +596,45 @@ class MemoryStore:
         self.memory_texts = []
         self.num_memories = 0
         self.next_write_index = 0
-        self.identity_index = -1
-        self.identity_text = None
         
-        logger.info(f"{LogConfig.CHECK} Memory store cleared")
+        # Reload protected memories if any
+        if not include_protected:
+            self._reload_protected_memories()
+        else:
+            self.identity_index = -1
+            self.identity_text = None
+        
+        logger.info(f"{LogConfig.CHECK} Memory store cleared (protected preserved: {not include_protected})")
+    
+    def _reload_protected_memories(self) -> None:
+        """Reload protected memories from database after clear"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, embedding, text, is_identity 
+            FROM memories 
+            WHERE is_protected = 1 OR is_identity = 1
+            ORDER BY id
+        """)
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        for row_id, embedding_blob, text, is_identity in rows:
+            embedding = np.frombuffer(embedding_blob, dtype=np.float32)
+            
+            if is_identity:
+                self.identity_text = text
+                self.identity_index = self.num_memories
+            
+            # Restore to GPU
+            if self.num_memories < self.max_memories:
+                write_index = self.num_memories
+                self.memory_keys[write_index] = embedding
+                self.memory_values[write_index] = embedding
+                self.memory_texts.append(text)
+                self.num_memories += 1
     
     def export_memories(self, filepath: str) -> None:
         """Export all memories to JSON file"""

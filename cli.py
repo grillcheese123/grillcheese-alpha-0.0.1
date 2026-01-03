@@ -136,6 +136,18 @@ Examples:
         help="Number of epochs for calibration (default: 20)"
     )
     
+    parser.add_argument(
+        "--teach",
+        action="store_true",
+        help="Enter protected teaching mode - memories created here will never be deleted"
+    )
+    
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Enter developer mode (password required) - advanced model improvement tools"
+    )
+    
     args = parser.parse_args()
     
     # Initialize system
@@ -265,8 +277,14 @@ Examples:
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
     
+    # Developer mode - password protected advanced features
+    if args.dev:
+        _developer_mode(phi3, memory, snn, brain)
+    # Teach mode - protected memory training
+    elif args.teach:
+        _teach_mode(phi3, memory, snn)
     # Interactive mode or single prompt
-    if args.interactive or (not prompt and not args.stats):
+    elif args.interactive or (not prompt and not args.stats):
         if learner:
             asyncio.run(_interactive_mode_async(phi3, memory, snn, learner, brain))
         else:
@@ -452,17 +470,30 @@ def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, lea
         # Print response
         print(f"\nGrillCheese: {response}\n")
         
-        # Print stats
+        # Print simplified, meaningful stats
         stats = memory.get_stats()
-        firing_rate = spike_metrics.get('firing_rate', 0) * 100
-        stats_line = f"[Spikes: {spike_metrics['spike_activity']:.0f} ({firing_rate:.1f}% rate) | Memories: {stats['total_memories']}"
+        
+        # Build stats line with useful info
+        stats_parts = [f"Memories: {stats['total_memories']}"]
+        
+        if brain_result is not None:
+            emo = brain_result['emotional_state']
+            stats_parts.append(f"{emo.dominant_emotion}")
+            
+            # Add stress if high
+            if brain_result['stress_level'] > 0.6:
+                stats_parts.append(f"Stress: {brain_result['stress_level']:.1f}")
+        
         if learner:
             lstats = learner.get_stats()
-            stats_line += f" | STDP: {lstats['stdp_updates']} updates"
-        if brain_result is not None:
-            stats_line += f" | Strategy: {brain_result['strategy']} | Stress: {brain_result['stress_level']:.2f}"
-        stats_line += "]"
-        print(stats_line)
+            if lstats['stdp_updates'] > 0:
+                stats_parts.append(f"Learned: {lstats['stdp_updates']} patterns")
+        
+        # Show GPU mode if enabled
+        if stats.get('gpu_enabled'):
+            stats_parts.append("GPU")
+        
+        print(f"[{' | '.join(stats_parts)}]")
         
     except Exception as e:
         print(f"\n{LogConfig.CROSS} Error: {e}")
@@ -503,6 +534,7 @@ def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
                     print(f"Total interactions: {brain_stats['brain_stats']['total_interactions']}")
                     print(f"Positive interactions: {brain_stats['brain_stats']['positive_interactions']}")
                     print(f"Empathetic responses: {brain_stats['brain_stats']['empathetic_responses']}")
+                    print(f"Current strategy: {brain_stats['basal_ganglia']['current_strategy']}")
                     print(f"Consciousness: {brain_stats['cns']['current_state']['consciousness']}")
                     print(f"Stress level: {brain_stats['cns']['current_state']['stress_level']:.2f}")
                 print()
@@ -564,13 +596,20 @@ def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
             
             print(f"\nGrillCheese: {response}")
             
+            # Show simplified stats
             stats = memory.get_stats()
-            stats_line = f"[Spikes: {spike_metrics['spike_activity']:.0f} | Memories: {stats['total_memories']}"
+            stats_parts = [f"Memories: {stats['total_memories']}"]
+            
             if brain_result is not None:
-                emo_state = brain_result['emotional_state']
-                stats_line += f" | {emo_state.dominant_emotion} (v:{emo_state.valence:.1f} a:{emo_state.arousal:.1f})"
-            stats_line += "]"
-            print(f"{stats_line}\n")
+                emo = brain_result['emotional_state']
+                stats_parts.append(f"{emo.dominant_emotion}")
+                if brain_result['stress_level'] > 0.6:
+                    stats_parts.append(f"Stress: {brain_result['stress_level']:.1f}")
+            
+            if stats.get('gpu_enabled'):
+                stats_parts.append("GPU")
+            
+            print(f"[{' | '.join(stats_parts)}]\n")
             
         except KeyboardInterrupt:
             if brain is not None:
@@ -723,5 +762,538 @@ async def _interactive_mode_async(phi3, memory: MemoryStore, snn: SNNCompute, le
         print("Goodbye!")
 
 
+
+
+def _developer_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
+    """Password-protected developer mode for model improvement"""
+    import getpass
+    from dev_auth import verify_dev_password
+    
+    print("\n" + "=" * 60)
+    print("DEVELOPER MODE - AUTHENTICATION REQUIRED")
+    print("=" * 60)
+    
+    # Authenticate
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        password = getpass.getpass("Developer password: ")
+        
+        if verify_dev_password(password):
+            print(f"{LogConfig.CHECK} Authentication successful\n")
+            break
+        else:
+            remaining = max_attempts - attempt - 1
+            if remaining > 0:
+                print(f"{LogConfig.CROSS} Invalid password. {remaining} attempts remaining.\n")
+            else:
+                print(f"{LogConfig.CROSS} Authentication failed. Access denied.")
+                return
+    
+    # Developer mode interface
+    print("=" * 60)
+    print("GRILLCHEESE DEVELOPER MODE")
+    print("=" * 60)
+    print("Advanced model improvement and analysis tools")
+    print("\nCommands:")
+    print("  export-training     - Export conversation pairs for fine-tuning")
+    print("  analyze-memory      - Deep memory analysis and statistics")
+    print("  edit-identity       - Edit system identity prompt")
+    print("  tune-params         - Adjust model parameters")
+    print("  test-retrieval      - Test memory retrieval with queries")
+    print("  export-embeddings   - Export embedding space for analysis")
+    print("  brain-dump          - Full brain state inspection")
+    print("  create-dataset      - Create fine-tuning dataset from sessions")
+    print("  stats               - Comprehensive system statistics")
+    print("  quit                - Exit developer mode")
+    print("=" * 60 + "\n")
+    
+    while True:
+        try:
+            user_input = input("Dev> ").strip()
+            
+            if not user_input:
+                continue
+            
+            parts = user_input.split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+            
+            if cmd in ['quit', 'exit', 'q']:
+                print("\nExiting developer mode...")
+                break
+            
+            elif cmd == 'export-training':
+                _dev_export_training(memory, arg)
+            
+            elif cmd == 'analyze-memory':
+                _dev_analyze_memory(memory)
+            
+            elif cmd == 'edit-identity':
+                _dev_edit_identity(memory, phi3)
+            
+            elif cmd == 'tune-params':
+                _dev_tune_params()
+            
+            elif cmd == 'test-retrieval':
+                _dev_test_retrieval(memory, phi3, arg)
+            
+            elif cmd == 'export-embeddings':
+                _dev_export_embeddings(memory, arg)
+            
+            elif cmd == 'brain-dump':
+                _dev_brain_dump(brain)
+            
+            elif cmd == 'create-dataset':
+                _dev_create_dataset(memory, arg)
+            
+            elif cmd == 'stats':
+                _dev_comprehensive_stats(memory, snn, brain)
+            
+            else:
+                print(f"Unknown command: {cmd}")
+                print("Type a command or 'quit' to exit")
+        
+        except KeyboardInterrupt:
+            print("\n\nExiting developer mode...")
+            break
+        except EOFError:
+            print("\n\nExiting developer mode...")
+            break
+        except Exception as e:
+            print(f"\nError: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+def _dev_export_training(memory: MemoryStore, output_file: str):
+    """Export conversation pairs for fine-tuning"""
+    import sqlite3
+    import json
+    
+    if not output_file:
+        output_file = "training_data.jsonl"
+    
+    print(f"Exporting training data to {output_file}...")
+    
+    conn = sqlite3.connect(memory.db_path)
+    cursor = conn.cursor()
+    
+    # Get all non-identity memories with metadata
+    cursor.execute("""
+        SELECT text, metadata, timestamp, access_count 
+        FROM memories 
+        WHERE is_identity = 0
+        ORDER BY timestamp DESC
+    """)
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # Create training pairs
+    pairs = []
+    for text, metadata_json, timestamp, access_count in rows:
+        metadata = json.loads(metadata_json) if metadata_json else {}
+        
+        # Extract prompt/response if available
+        if 'type' in metadata:
+            pairs.append({
+                'text': text,
+                'metadata': metadata,
+                'timestamp': timestamp,
+                'access_count': access_count
+            })
+    
+    # Write to JSONL
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for pair in pairs:
+            f.write(json.dumps(pair) + '\n')
+    
+    print(f"{LogConfig.CHECK} Exported {len(pairs)} entries to {output_file}")
+
+
+def _dev_analyze_memory(memory: MemoryStore):
+    """Deep memory analysis"""
+    import sqlite3
+    
+    conn = sqlite3.connect(memory.db_path)
+    cursor = conn.cursor()
+    
+    print("\n=== Deep Memory Analysis ===\n")
+    
+    # Total stats
+    cursor.execute("SELECT COUNT(*), COUNT(DISTINCT is_protected), COUNT(DISTINCT is_identity) FROM memories")
+    total, _, _ = cursor.fetchone()
+    
+    cursor.execute("SELECT COUNT(*) FROM memories WHERE is_protected = 1")
+    protected = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM memories WHERE is_identity = 1")
+    identity = cursor.fetchone()[0]
+    
+    print(f"Total memories: {total}")
+    print(f"Protected: {protected} ({protected/total*100:.1f}%)" if total > 0 else "Protected: 0")
+    print(f"Identity: {identity}")
+    print(f"Regular: {total - protected - identity}")
+    
+    # Access patterns
+    cursor.execute("SELECT AVG(access_count), MAX(access_count) FROM memories")
+    avg_access, max_access = cursor.fetchone()
+    
+    print(f"\nAccess Patterns:")
+    print(f"Average access count: {avg_access:.2f}" if avg_access else "No access data")
+    print(f"Max access count: {max_access}" if max_access else "No access data")
+    
+    # Most accessed
+    cursor.execute("""
+        SELECT text, access_count 
+        FROM memories 
+        WHERE is_identity = 0
+        ORDER BY access_count DESC 
+        LIMIT 5
+    """)
+    
+    top_accessed = cursor.fetchall()
+    if top_accessed:
+        print(f"\nMost Accessed Memories:")
+        for i, (text, count) in enumerate(top_accessed, 1):
+            print(f"{i}. [{count} accesses] {text[:60]}...")
+    
+    # Temporal distribution
+    cursor.execute("""
+        SELECT 
+            DATE(timestamp) as date,
+            COUNT(*) as count
+        FROM memories
+        GROUP BY DATE(timestamp)
+        ORDER BY date DESC
+        LIMIT 7
+    """)
+    
+    daily = cursor.fetchall()
+    if daily:
+        print(f"\nMemories Created (Last 7 Days):")
+        for date, count in daily:
+            print(f"{date}: {count} memories")
+    
+    conn.close()
+    print()
+
+
+def _dev_edit_identity(memory: MemoryStore, phi3):
+    """Edit system identity prompt"""
+    import sqlite3
+    
+    print("\n=== Edit System Identity ===\n")
+    print("Current identity:")
+    print("-" * 60)
+    print(memory.identity_text[:500] + "..." if memory.identity_text and len(memory.identity_text) > 500 else memory.identity_text)
+    print("-" * 60)
+    
+    print("\nOptions:")
+    print("1. Edit in external editor")
+    print("2. Replace with new text")
+    print("3. Cancel")
+    
+    choice = input("\nChoice (1-3): ").strip()
+    
+    if choice == '1':
+        import tempfile
+        import subprocess
+        
+        # Write to temp file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(memory.identity_text or "")
+            temp_path = f.name
+        
+        # Open in editor
+        editor = os.environ.get('EDITOR', 'notepad' if os.name == 'nt' else 'nano')
+        subprocess.call([editor, temp_path])
+        
+        # Read back
+        with open(temp_path, 'r') as f:
+            new_identity = f.read().strip()
+        
+        os.unlink(temp_path)
+        
+        if new_identity:
+            embedding = phi3.get_embedding(new_identity)
+            memory.store_identity(new_identity, embedding)
+            print(f"{LogConfig.CHECK} Identity updated")
+        else:
+            print("Cancelled - empty identity")
+    
+    elif choice == '2':
+        print("\nEnter new identity (Ctrl+D or Ctrl+Z when done):")
+        lines = []
+        try:
+            while True:
+                line = input()
+                lines.append(line)
+        except EOFError:
+            pass
+        
+        new_identity = '\n'.join(lines).strip()
+        if new_identity:
+            embedding = phi3.get_embedding(new_identity)
+            memory.store_identity(new_identity, embedding)
+            print(f"\n{LogConfig.CHECK} Identity updated")
+        else:
+            print("\nCancelled - empty identity")
+    
+    else:
+        print("Cancelled")
+
+
+def _dev_tune_params():
+    """Adjust model parameters"""
+    print("\n=== Model Parameter Tuning ===\n")
+    print("Current parameters:")
+    print(f"  Temperature: {ModelConfig.TEMPERATURE}")
+    print(f"  Top-P: {ModelConfig.TOP_P}")
+    print(f"  Max tokens (GPU): {ModelConfig.MAX_NEW_TOKENS_GPU}")
+    print(f"  Max context items: {ModelConfig.MAX_CONTEXT_ITEMS}")
+    print("\nNote: Changes are runtime only. Edit config.py for persistence.")
+    print("\nPress Enter to continue...")
+    input()
+
+
+def _dev_test_retrieval(memory: MemoryStore, phi3, query: str):
+    """Test memory retrieval"""
+    if not query:
+        query = input("Enter test query: ").strip()
+    
+    if not query:
+        print("No query provided")
+        return
+    
+    print(f"\nTesting retrieval for: '{query}'\n")
+    
+    embedding = phi3.get_embedding(query)
+    results = memory.retrieve(embedding, k=10, include_identity=False)
+    
+    print(f"Retrieved {len(results)} memories:")
+    for i, text in enumerate(results, 1):
+        print(f"{i}. {text[:80]}")
+    print()
+
+
+def _dev_export_embeddings(memory: MemoryStore, output_file: str):
+    """Export embeddings for analysis"""
+    import numpy as np
+    
+    if not output_file:
+        output_file = "embeddings.npz"
+    
+    print(f"Exporting embeddings to {output_file}...")
+    
+    # Export memory keys and values
+    np.savez_compressed(
+        output_file,
+        keys=memory.memory_keys[:memory.num_memories],
+        values=memory.memory_values[:memory.num_memories],
+        texts=np.array(memory.memory_texts[:memory.num_memories], dtype=object)
+    )
+    
+    print(f"{LogConfig.CHECK} Exported {memory.num_memories} embeddings")
+
+
+def _dev_brain_dump(brain):
+    """Full brain state inspection"""
+    if brain is None:
+        print("Brain module not loaded")
+        return
+    
+    print("\n=== Brain State Dump ===\n")
+    
+    stats = brain.get_stats()
+    
+    print("Amygdala State:")
+    emo = stats['amygdala']['current_state']
+    print(f"  Valence: {emo['valence']:.3f}")
+    print(f"  Arousal: {emo['arousal']:.3f}")
+    print(f"  Dominant: {emo['dominant_emotion']}")
+    
+    print("\nCNS State:")
+    cns = stats['cns']['current_state']
+    print(f"  Consciousness: {cns['consciousness']}")
+    print(f"  Stress: {cns['stress_level']:.3f}")
+    
+    print("\nBasal Ganglia:")
+    bg = stats['basal_ganglia']
+    print(f"  Current strategy: {bg['current_strategy']}")
+    print(f"  Hebbian weights shape: {bg['hebbian_weights_shape']}")
+    
+    print("\nExperience:")
+    exp = stats['experience']
+    print(f"  Total interactions: {exp['total_experiences']}")
+    print(f"  Average quality: {exp['avg_quality']:.3f}")
+    print(f"  Best strategy: {exp['best_strategy']}")
+    print()
+
+
+def _dev_create_dataset(memory: MemoryStore, output_file: str):
+    """Create fine-tuning dataset from memory"""
+    import sqlite3
+    import json
+    
+    if not output_file:
+        output_file = "finetune_dataset.jsonl"
+    
+    print(f"Creating fine-tuning dataset: {output_file}")
+    print("This will create prompt/completion pairs from memories...")
+    
+    # This is a placeholder - implement based on your fine-tuning needs
+    print("\nDataset creation requires conversation history.")
+    print("Current implementation exports raw memories.")
+    print("Implement conversation tracking for full training pairs.")
+
+
+def _dev_comprehensive_stats(memory: MemoryStore, snn: SNNCompute, brain):
+    """Comprehensive system statistics"""
+    print("\n=== Comprehensive System Statistics ===\n")
+    
+    # Memory stats
+    _show_stats(memory)
+    
+    # Brain stats
+    if brain:
+        print("\n=== Brain Statistics ===")
+        stats = brain.get_stats()
+        print(f"Total interactions: {stats['brain_stats']['total_interactions']}")
+        print(f"Current strategy: {stats['basal_ganglia']['current_strategy']}")
+        print(f"Stress level: {stats['cns']['current_state']['stress_level']:.2f}")
+    
+    # GPU stats
+    if memory.gpu:
+        print("\n=== GPU Statistics ===")
+        print("Vulkan compute: ENABLED")
+        print(f"Embedding dimension: {memory.embedding_dim}")
+    
+    print()
+
+
+def _teach_mode(phi3, memory: MemoryStore, snn: SNNCompute):
+    """Protected teaching mode - create memories that will never be deleted"""
+    print("\n" + "=" * 60)
+    print("PROTECTED TEACHING MODE")
+    print("=" * 60)
+    print("All memories created here are PROTECTED and will never be deleted.")
+    print("\nCommands:")
+    print("  teach <text>        - Store protected memory from text")
+    print("  file <path>         - Import training data from file")
+    print("  list                - Show all protected memories")
+    print("  stats               - Show memory statistics")
+    print("  quit                - Exit teach mode")
+    print("=" * 60 + "\n")
+    
+    while True:
+        try:
+            user_input = input("Teach> ").strip()
+            
+            if not user_input:
+                continue
+            
+            # Parse command
+            parts = user_input.split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+            
+            if cmd in ['quit', 'exit', 'q']:
+                print("\nExiting teach mode...")
+                break
+            
+            elif cmd == 'teach':
+                if not arg:
+                    print("Usage: teach <text>")
+                    continue
+                
+                # Get embedding
+                embedding = phi3.get_embedding(arg)
+                
+                # Store as protected
+                memory.store(embedding, arg, is_protected=True)
+                print(f"{LogConfig.CHECK} Protected memory stored: {arg[:60]}...")
+            
+            elif cmd == 'file':
+                if not arg:
+                    print("Usage: file <path>")
+                    continue
+                
+                filepath = Path(arg)
+                if not filepath.exists():
+                    print(f"{LogConfig.CROSS} File not found: {filepath}")
+                    continue
+                
+                # Read file
+                try:
+                    content = filepath.read_text(encoding='utf-8')
+                    lines = [line.strip() for line in content.split('\n') if line.strip()]
+                    
+                    print(f"Found {len(lines)} lines in {filepath.name}")
+                    confirm = input(f"Store all {len(lines)} as protected memories? (yes/no): ")
+                    
+                    if confirm.lower() != 'yes':
+                        print("Cancelled.")
+                        continue
+                    
+                    # Store each line as protected memory
+                    for i, line in enumerate(lines, 1):
+                        embedding = phi3.get_embedding(line)
+                        memory.store(embedding, line, is_protected=True)
+                        print(f"\r[{i}/{len(lines)}] Storing...", end='')
+                    
+                    print(f"\n{LogConfig.CHECK} Imported {len(lines)} protected memories from {filepath.name}")
+                
+                except Exception as e:
+                    print(f"{LogConfig.CROSS} Error reading file: {e}")
+            
+            elif cmd == 'list':
+                # Query database for protected memories
+                import sqlite3
+                conn = sqlite3.connect(memory.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT text, timestamp FROM memories WHERE is_protected = 1 ORDER BY timestamp DESC")
+                rows = cursor.fetchall()
+                conn.close()
+                
+                if not rows:
+                    print("No protected memories found.")
+                else:
+                    print(f"\n=== Protected Memories ({len(rows)}) ===")
+                    for i, (text, timestamp) in enumerate(rows, 1):
+                        print(f"{i}. [{timestamp[:19]}] {text[:80]}")
+                    print()
+            
+            elif cmd == 'stats':
+                _show_stats(memory)
+                
+                # Show protected count
+                import sqlite3
+                conn = sqlite3.connect(memory.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM memories WHERE is_protected = 1")
+                protected_count = cursor.fetchone()[0]
+                conn.close()
+                
+                print(f"\nProtected memories: {protected_count}")
+                print()
+            
+            else:
+                print(f"Unknown command: {cmd}")
+                print("Use 'teach <text>', 'file <path>', 'list', 'stats', or 'quit'")
+        
+        except KeyboardInterrupt:
+            print("\n\nExiting teach mode...")
+            break
+        except EOFError:
+            print("\n\nExiting teach mode...")
+            break
+        except Exception as e:
+            print(f"\nError: {e}")
+            import traceback
+            traceback.print_exc()
+
+
 if __name__ == "__main__":
     main()
+

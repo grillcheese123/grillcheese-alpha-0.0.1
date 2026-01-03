@@ -209,6 +209,19 @@ class VulkanPipelines:
         
         return descriptor_set
     
+    def get_cache_stats(self):
+        """Get descriptor set cache statistics"""
+        total = self.cache_hits + self.cache_misses
+        hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
+        
+        return {
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'hit_rate': hit_rate,
+            'cached_sets': len(self.descriptor_set_cache),
+            'max_pool_size': 500
+        }
+    
     def clear_descriptor_cache(self):
         """Clear all cached descriptor sets"""
         if hasattr(self.core, 'device') and self.core.device:
@@ -232,4 +245,3 @@ class VulkanPipelines:
             # Destroy descriptor set layouts
             for layout in self.descriptor_set_layouts.values():
                 vkDestroyDescriptorSetLayout(self.core.device, layout, None)
-
