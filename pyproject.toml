@@ -1,7 +1,7 @@
 [project]
 name = "grillcheese-amd-mvp"
 version = "0.1.0"
-description = "Vulkan AI System for local, business and enterprise usage"
+description = "Vulkan AI System for local, business and enterprise usage focusing on low power consumption, low footprint and afforable inference / training."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
