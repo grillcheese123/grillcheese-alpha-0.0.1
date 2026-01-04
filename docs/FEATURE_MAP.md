@@ -5,7 +5,7 @@
 
 ---
 
-## 🧠 Core Architecture
+## Core Architecture
 
 ### Language Model
 - **Model**: Microsoft Phi-3 Mini (3.8B parameters)
@@ -27,7 +27,7 @@
 
 ---
 
-## 💾 Memory System
+## Memory System
 
 ### Storage Engine
 - **Database**: SQLite persistent storage
@@ -43,7 +43,7 @@
    - Temporal metadata
    
 2. **Protected Memories**
-   - Never deleted
+   - Persistent and non-deletable
    - Higher retrieval priority
    - Created via teach mode
    
@@ -67,7 +67,7 @@
 
 ---
 
-## 🧬 Bio-Inspired Brain System
+## Bio-Inspired Brain System
 
 ### Amygdala (Emotional Processing)
 - **Valence**: -1 (negative) to +1 (positive)
@@ -105,7 +105,7 @@
 
 ---
 
-## 🔬 Spiking Neural Network (SNN)
+## Spiking Neural Network (SNN)
 
 ### LIF Neurons
 - **Count**: 1,000 neurons (configurable)
@@ -127,7 +127,7 @@
 
 ---
 
-## 🎮 Interaction Modes
+## Interaction Modes
 
 ### 1. Interactive Mode
 **Access**: `python cli.py --interactive` or `python cli.py`
@@ -185,7 +185,7 @@
 - `tune-params` - View configuration
 - `test-retrieval` - Test memory search
 - `export-embeddings` - Export vectors (NPZ)
-- `brain-dump` - Full brain state
+- `brain-dump` - Export complete brain state
 - `create-dataset` - Fine-tuning dataset
 - `stats` - Comprehensive statistics
 - `quit` - Exit
@@ -197,7 +197,7 @@
 
 ---
 
-## 🛠️ System Features
+## System Features
 
 ### Configuration
 **File**: `config.py`
@@ -228,7 +228,7 @@
 ### Logging
 - **Level**: INFO (configurable)
 - **Format**: `[%(levelname)s] %(message)s`
-- **Unicode**: ✓ (check), ✗ (cross), ⚠ (warning)
+- **Unicode Symbols**: check (✓), cross (✗), warning (⚠)
 
 ### Error Handling
 - Graceful GPU fallback
@@ -238,7 +238,7 @@
 
 ---
 
-## 📊 Performance Optimizations
+## Performance Optimizations
 
 ### Memory Operations
 - **GPU FAISS**: 2-5x faster than CPU (10K memories)
@@ -260,13 +260,13 @@
 
 ---
 
-## 🔒 Security & Privacy
+## Security & Privacy
 
-### Local-First
-- **No Cloud**: All processing on-device
-- **No Tracking**: Zero telemetry
-- **Private Data**: Never leaves machine
-- **Offline Capable**: Full functionality without internet
+### Local-First Architecture
+- **On-Device Processing**: All computation performed locally
+- **Zero Telemetry**: No tracking or data collection
+- **Data Privacy**: All private data remains on local machine
+- **Offline Operation**: Full functionality available without internet connection
 
 ### Authentication
 - **Developer Mode**: Password-protected
@@ -282,11 +282,12 @@
 
 ---
 
-## 📁 File Structure
+## File Structure
 
 ```
 backend/
-├── cli.py                    # Main entry point
+├── cli/
+│   └── cli.py                # Main CLI entry point
 ├── config.py                 # Configuration
 ├── identity.py               # System identity
 ├── dev_auth.py              # Developer authentication
@@ -318,7 +319,7 @@ backend/
 
 ---
 
-## 🧪 Testing & Validation
+## Testing & Validation
 
 ### Test Suite
 **File**: `tests/test_faiss_gpu.py`
@@ -347,9 +348,9 @@ backend/
 
 ---
 
-## 📈 Roadmap & Future Features
+## Roadmap & Future Features
 
-### Implemented ✅
+### Implemented
 - [x] GPU-accelerated memory
 - [x] FAISS similarity search
 - [x] Protected memories
@@ -361,13 +362,13 @@ backend/
 - [x] Response optimization
 - [x] Descriptor caching
 
-### In Progress 🚧
+### In Progress
 - [ ] STDP learning implementation
 - [ ] Conversation history tracking
 - [ ] Fine-tuning dataset creation
 - [ ] Embedding space visualization
 
-### Planned 🔮
+### Planned
 - [ ] Multi-turn conversation context
 - [ ] Voice input/output
 - [ ] Document ingestion
@@ -379,20 +380,20 @@ backend/
 
 ---
 
-## 🎯 Key Strengths
+## Key Strengths
 
-1. **Privacy-First**: 100% local processing
-2. **Bio-Inspired**: Realistic emotional intelligence
-3. **GPU-Accelerated**: 2-5x faster memory operations
-4. **Protected Teaching**: Permanent knowledge base
-5. **Developer Tools**: Advanced model improvement
-6. **Modular Design**: Easy to extend
-7. **Production Ready**: Error handling, fallbacks
-8. **Well Documented**: Comprehensive guides
+1. **Privacy-First Architecture**: All processing performed locally with no external data transmission
+2. **Bio-Inspired Design**: Emotionally intelligent system based on biological models
+3. **GPU-Accelerated Performance**: Memory operations 2-5x faster than CPU-based implementations
+4. **Protected Teaching System**: Permanent knowledge base with protected memory storage
+5. **Developer Tools**: Advanced toolset for model improvement and analysis
+6. **Modular Design**: Extensible architecture for easy customization
+7. **Production Ready**: Comprehensive error handling and fallback mechanisms
+8. **Comprehensive Documentation**: Detailed guides and references for all features
 
 ---
 
-## 📊 Quick Stats
+## Quick Stats
 
 | Metric | Value |
 |--------|-------|
@@ -409,7 +410,7 @@ backend/
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ```bash
 # Install dependencies
@@ -433,7 +434,7 @@ python cli.py "Hello, how are you?"
 
 ---
 
-## 📚 Documentation Index
+## Documentation Index
 
 - **FEATURE_MAP.md** (this file) - Complete overview
 - **TEACH_MODE.md** - Public teaching guide
@@ -442,7 +443,4 @@ python cli.py "Hello, how are you?"
 - **DEPLOYMENT_GUIDE.md** - Production deployment
 - **PRODUCTION_FIXES.md** - Critical fixes applied
 
----
 
-**Built with** ❤️ **by the GrillCheese team**  
-**Focus**: Privacy, Performance, Intelligence
