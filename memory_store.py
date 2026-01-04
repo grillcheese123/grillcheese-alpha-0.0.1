@@ -124,6 +124,19 @@ class MemoryStore:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # Check if table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'")
+        if not cursor.fetchone():
+            conn.close()
+            logger.debug("No memories table found, starting with empty memory")
+            # Initialize empty GPU buffers
+            self.memory_keys = np.zeros((self.max_memories, self.embedding_dim), dtype=np.float32)
+            self.memory_values = np.zeros((self.max_memories, self.embedding_dim), dtype=np.float32)
+            self.num_memories = 0
+            self.next_write_index = 0
+            self.identity_index = -1
+            return
+        
         # Load identity memory first, then others
         cursor.execute("SELECT embedding, text, is_identity FROM memories ORDER BY is_identity DESC, id")
         rows = cursor.fetchall()
@@ -214,6 +227,7 @@ class MemoryStore:
             VALUES (?, ?, ?, 1)
         """, (embedding_blob, identity_text, timestamp))
         
+        identity_id = cursor.lastrowid
         conn.commit()
         conn.close()
         
@@ -250,9 +264,10 @@ class MemoryStore:
             self.memory_texts.append(identity_text)
         
         self.identity_text = identity_text
-        logger.info(f"{LogConfig.CHECK} Identity stored at index {write_index}")
+        logger.info(f"{LogConfig.CHECK} Identity stored at index {write_index}, ID: {identity_id}")
+        return identity_id
     
-    def store(self, embedding: np.ndarray, text: str, metadata: Optional[Dict[str, Any]] = None, is_protected: bool = False) -> None:
+    def store(self, embedding: np.ndarray, text: str, metadata: Optional[Dict[str, Any]] = None, is_protected: bool = False) -> Optional[int]:
         """
         Store a new memory using GPU shaders with atomic operations.
         
@@ -301,16 +316,40 @@ class MemoryStore:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # Ensure table exists (important for :memory: databases)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'")
+        if not cursor.fetchone():
+            # Table doesn't exist, create it
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    embedding BLOB NOT NULL,
+                    text TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed TEXT,
+                    metadata TEXT,
+                    is_identity INTEGER DEFAULT 0,
+                    is_protected INTEGER DEFAULT 0
+                )
+            """)
+            # Add indexes
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_identity ON memories(is_identity)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_protected ON memories(is_protected)")
+        
         embedding_blob = embedding.tobytes()
         metadata_json = json.dumps(metadata) if metadata else None
         timestamp = datetime.now().isoformat()
         
+        memory_id = None
         try:
             cursor.execute("""
                 INSERT INTO memories (embedding, text, timestamp, metadata, is_identity, is_protected)
                 VALUES (?, ?, ?, ?, 0, ?)
             """, (embedding_blob, text, timestamp, metadata_json, 1 if is_protected else 0))
             
+            memory_id = cursor.lastrowid
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -327,7 +366,68 @@ class MemoryStore:
         else:
             self.memory_texts.append(text)
         
-        logger.debug(f"Memory stored at index {write_index}")
+        logger.debug(f"Memory stored at index {write_index}, ID: {memory_id}")
+        return memory_id
+    
+    def add_memory(
+        self,
+        text: str,
+        embedding: Optional[np.ndarray] = None,
+        modality: str = 'text',
+        language: str = 'en',
+        quality_score: float = 0.5,
+        source: str = 'interaction',
+        protected: bool = False,
+        identity: bool = False,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """
+        Add memory with extended metadata support (compatible with knowledge distillation).
+        
+        This is an enhanced version of store() that returns a memory ID and supports
+        additional metadata fields like modality, language, quality_score, etc.
+        
+        Args:
+            text: Memory text content
+            embedding: Embedding vector (required)
+            modality: Modality type ('text', 'image', 'audio', 'multimodal')
+            language: Language code (e.g., 'en', 'es', 'fr')
+            quality_score: Quality score (0.0 to 1.0)
+            source: Source of the memory ('interaction', 'document', 'external')
+            protected: If True, memory will never be pruned
+            identity: If True, treat as identity memory
+            metadata: Additional metadata dictionary
+            
+        Returns:
+            Memory ID (database row ID)
+        """
+        if embedding is None:
+            raise ValueError("Embedding is required for add_memory")
+        
+        # Normalize embedding
+        if len(embedding) != self.embedding_dim:
+            raise ValueError(f"Embedding dimension mismatch: expected {self.embedding_dim}, got {len(embedding)}")
+        
+        embedding = embedding.astype(np.float32).flatten()
+        
+        # Merge metadata
+        full_metadata = {
+            'modality': modality,
+            'language': language,
+            'quality_score': quality_score,
+            'source': source,
+            **(metadata or {})
+        }
+        
+        # If identity flag is set, use identity storage
+        if identity:
+            identity_id = self.store_identity(embedding, text)
+            return identity_id if identity_id is not None else -1
+        
+        # Use regular store method with metadata (now returns ID)
+        memory_id = self.store(embedding, text, metadata=full_metadata, is_protected=protected)
+        
+        return memory_id if memory_id is not None else -1
     
     def retrieve(
         self,

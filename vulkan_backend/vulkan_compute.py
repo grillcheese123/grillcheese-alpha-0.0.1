@@ -111,6 +111,191 @@ class VulkanCompute:
         """Generate time cell firing rates based on elapsed time"""
         return self.cells.time_cell(*args, **kwargs)
     
+    # Embedder operations - for custom SentencePiece embedder
+    def position_encoding(self, embeddings, batch_size, seq_len, hidden_dim, max_position=512):
+        """Add positional encoding using position-encoding shader"""
+        import struct
+        import numpy as np
+        from .base import VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        from vulkan import vkDestroyBuffer, vkFreeMemory
+        
+        buf_input, mem_input = self._create_buffer(
+            embeddings.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        buf_output, mem_output = self._create_buffer(
+            embeddings.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        
+        self._upload_buffer(buf_input, mem_input, embeddings)
+        
+        pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
+            'position-encoding', 2, push_constant_size=16
+        )
+        
+        descriptor_set = self.pipelines.get_cached_descriptor_set(
+            'position-encoding',
+            [(buf_input, embeddings.nbytes), (buf_output, embeddings.nbytes)]
+        )
+        
+        push_constants = struct.pack('IIII', batch_size, seq_len, hidden_dim, max_position)
+        
+        workgroups = (batch_size * seq_len * hidden_dim + 255) // 256
+        self._dispatch_compute(pipeline, pipeline_layout, descriptor_set, 
+                              workgroups, push_constants)
+        
+        output = self._download_buffer(mem_output, embeddings.nbytes, dtype=np.float32)
+        
+        vkDestroyBuffer(self.device, buf_input, None)
+        vkDestroyBuffer(self.device, buf_output, None)
+        vkFreeMemory(self.device, mem_input, None)
+        vkFreeMemory(self.device, mem_output, None)
+        
+        return output
+    
+    def mean_pooling(self, embeddings, attention_mask, batch_size, seq_len, hidden_dim):
+        """Mean pooling over sequence using mean-pooling shader"""
+        import struct
+        import numpy as np
+        from .base import VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        from vulkan import vkDestroyBuffer, vkFreeMemory
+        
+        output_size = batch_size * hidden_dim
+        
+        buf_emb, mem_emb = self._create_buffer(
+            embeddings.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        buf_mask, mem_mask = self._create_buffer(
+            attention_mask.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        buf_output, mem_output = self._create_buffer(
+            output_size * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        
+        self._upload_buffer(buf_emb, mem_emb, embeddings)
+        self._upload_buffer(buf_mask, mem_mask, attention_mask)
+        
+        pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
+            'mean-pooling', 3, push_constant_size=12
+        )
+        
+        descriptor_set = self.pipelines.get_cached_descriptor_set(
+            'mean-pooling',
+            [
+                (buf_emb, embeddings.nbytes),
+                (buf_mask, attention_mask.nbytes),
+                (buf_output, output_size * 4)
+            ]
+        )
+        
+        push_constants = struct.pack('III', batch_size, seq_len, hidden_dim)
+        
+        workgroups = (batch_size * hidden_dim + 255) // 256
+        self._dispatch_compute(pipeline, pipeline_layout, descriptor_set,
+                              workgroups, push_constants)
+        
+        output = self._download_buffer(mem_output, output_size * 4, dtype=np.float32)
+        
+        vkDestroyBuffer(self.device, buf_emb, None)
+        vkDestroyBuffer(self.device, buf_mask, None)
+        vkDestroyBuffer(self.device, buf_output, None)
+        vkFreeMemory(self.device, mem_emb, None)
+        vkFreeMemory(self.device, mem_mask, None)
+        vkFreeMemory(self.device, mem_output, None)
+        
+        return output
+    
+    def l2_normalize(self, embeddings, batch_size, hidden_dim):
+        """L2 normalize embeddings using l2-normalize shader"""
+        import struct
+        import numpy as np
+        from .base import VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        from vulkan import vkDestroyBuffer, vkFreeMemory
+        
+        buf_input, mem_input = self._create_buffer(
+            embeddings.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        buf_output, mem_output = self._create_buffer(
+            embeddings.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        
+        self._upload_buffer(buf_input, mem_input, embeddings)
+        
+        pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
+            'l2-normalize', 2, push_constant_size=8
+        )
+        
+        descriptor_set = self.pipelines.get_cached_descriptor_set(
+            'l2-normalize',
+            [(buf_input, embeddings.nbytes), (buf_output, embeddings.nbytes)]
+        )
+        
+        push_constants = struct.pack('II', batch_size, hidden_dim)
+        
+        workgroups = batch_size
+        self._dispatch_compute(pipeline, pipeline_layout, descriptor_set,
+                              workgroups, push_constants)
+        
+        output = self._download_buffer(mem_output, embeddings.nbytes, dtype=np.float32)
+        
+        vkDestroyBuffer(self.device, buf_input, None)
+        vkDestroyBuffer(self.device, buf_output, None)
+        vkFreeMemory(self.device, mem_input, None)
+        vkFreeMemory(self.device, mem_output, None)
+        
+        return output
+    
+    def embedding_lookup(self, token_ids, embedding_table, vocab_size, hidden_dim):
+        """Embedding lookup using existing embedding-lookup shader"""
+        import struct
+        import numpy as np
+        from .base import VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        from vulkan import vkDestroyBuffer, vkFreeMemory
+        
+        output_size = len(token_ids) * hidden_dim
+        
+        buf_ids, mem_ids = self._create_buffer(
+            token_ids.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        buf_table, mem_table = self._create_buffer(
+            embedding_table.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        buf_output, mem_output = self._create_buffer(
+            output_size * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        )
+        
+        self._upload_buffer(buf_ids, mem_ids, token_ids)
+        self._upload_buffer(buf_table, mem_table, embedding_table.flatten())
+        
+        pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
+            'embedding-lookup', 3, push_constant_size=12
+        )
+        
+        descriptor_set = self.pipelines.get_cached_descriptor_set(
+            'embedding-lookup',
+            [
+                (buf_ids, token_ids.nbytes),
+                (buf_table, embedding_table.nbytes),
+                (buf_output, output_size * 4)
+            ]
+        )
+        
+        push_constants = struct.pack('III', len(token_ids), vocab_size, hidden_dim)
+        
+        workgroups = (output_size + 255) // 256
+        self._dispatch_compute(pipeline, pipeline_layout, descriptor_set,
+                              workgroups, push_constants)
+        
+        output = self._download_buffer(mem_output, output_size * 4, dtype=np.float32)
+        
+        vkDestroyBuffer(self.device, buf_ids, None)
+        vkDestroyBuffer(self.device, buf_table, None)
+        vkDestroyBuffer(self.device, buf_output, None)
+        vkFreeMemory(self.device, mem_ids, None)
+        vkFreeMemory(self.device, mem_table, None)
+        vkFreeMemory(self.device, mem_output, None)
+        
+        return output
+    
     def __del__(self):
         """Cleanup Vulkan resources"""
         if hasattr(self, 'pipelines'):

@@ -1,10 +1,10 @@
 {
-  "items_processed": 0,
+  "items_processed": 227,
   "conversations_learned": 0,
-  "vocab_files_ingested": 0,
-  "stdp_updates": 0,
-  "spikes_generated": 0,
+  "vocab_files_ingested": 250,
+  "stdp_updates": 1075959,
+  "spikes_generated": 54171.0,
   "errors": 0,
-  "start_time": "2026-01-03T14:15:00.959753",
+  "start_time": "2026-01-04T11:13:33.551862",
   "last_save": null
 }

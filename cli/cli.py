@@ -221,7 +221,7 @@ Examples:
         sys.exit(1)
     
     # Store system identity if not already stored
-    if memory.get_identity() and memory.identity_index == -1:
+    if memory.get_identity() is None:
         print("Storing system identity...")
         identity_emb = phi3.get_embedding(DEFAULT_IDENTITY)
         memory.store_identity(identity_emb, DEFAULT_IDENTITY)

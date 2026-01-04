@@ -1,0 +1,31 @@
+# Multimodal Knowledge Distillation Requirements
+
+# Core
+numpy>=1.24.0
+scipy>=1.10.0
+
+# ONNX Runtime for AMD GPU
+onnxruntime>=1.16.0
+onnxruntime-directml>=1.16.0  # For Windows DirectML
+
+# Language Processing
+lingua-language-detector>=2.0.0  # Fast language detection
+
+# Image Processing
+Pillow>=10.0.0
+
+# Audio Processing
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Database
+# sqlite3 is built-in to Python
+
+# Optional: Model conversion tools
+transformers>=4.35.0
+optimum>=1.15.0
+onnx>=1.15.0
+
+# Optional: Advanced features
+faiss-cpu>=1.7.4  # For GPU-accelerated similarity search
+sentence-transformers>=2.2.0  # For embedding models
