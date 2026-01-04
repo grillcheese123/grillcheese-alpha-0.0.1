@@ -1,0 +1,21 @@
+{
+  "enabled_modules": {
+    "memory_backends": [],
+    "model_providers": [],
+    "processing_hooks": [],
+    "api_extensions": [],
+    "tools": []
+  },
+  "defaults": {
+    "memory_backend": "sqlite_faiss",
+    "model_provider": "gguf"
+  },
+  "module_settings": {},
+  "scan_directories": {
+    "official": true,
+    "core": true,
+    "community": true,
+    "marketplace": true
+  }
+}
+

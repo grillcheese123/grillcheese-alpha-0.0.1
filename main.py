@@ -18,6 +18,8 @@ from config import ServerConfig, MemoryConfig, SNNConfig, LogConfig, ModelConfig
 from memory_store import MemoryStore
 from identity import DEFAULT_IDENTITY
 from vulkan_backend import SNNCompute
+from modules.registry import ModuleRegistry
+from modules.tools import ToolExecutor
 
 # Configure logging
 logging.basicConfig(level=LogConfig.LEVEL, format=LogConfig.FORMAT)
@@ -76,29 +78,59 @@ memory = None
 snn = None
 brain = None
 learner = None
+registry = None
+tool_executor = None
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize model and components on startup"""
-    global phi3, memory, snn, brain, learner
+    global phi3, memory, snn, brain, learner, registry, tool_executor
     
     logger.info("Starting GrillCheese AI server...")
     
-    # Initialize model (try GGUF first, then PyTorch)
-    phi3 = _init_model()
+    # Initialize module registry and load plugins
+    logger.info("Loading plugins and modules...")
+    registry = ModuleRegistry()
+    await registry.load_all_modules()
+    logger.info(f"{LogConfig.CHECK} Plugins loaded")
     
-    # Initialize memory store with correct embedding dimension (auto-detected)
-    embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
-    logger.info(f"Detected embedding dimension: {embedding_dim}")
-    logger.info(f"Initializing memory store (embedding_dim={embedding_dim})...")
-    memory = MemoryStore(
-        db_path=MemoryConfig.DB_PATH,
-        max_memories=MemoryConfig.MAX_MEMORIES,
-        embedding_dim=embedding_dim,
-        identity=DEFAULT_IDENTITY
-    )
+    # Register API extensions
+    for extension in registry.api_extensions:
+        try:
+            extension.register_routes(app)
+            extension.register_websockets(app)
+            logger.info(f"{LogConfig.CHECK} API extension registered: {type(extension).__name__}")
+        except Exception as e:
+            logger.error(f"Failed to register API extension: {e}")
+    
+    # Initialize model provider (from registry or fallback)
+    phi3 = registry.get_active_model_provider()
+    if phi3 is None:
+        logger.warning("No model provider found in registry, falling back to direct initialization")
+        phi3 = _init_model()
+    
+    # Initialize memory backend (from registry or fallback)
+    memory = registry.get_active_memory_backend()
+    if memory is None:
+        logger.warning("No memory backend found in registry, falling back to direct initialization")
+        embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
+        logger.info(f"Detected embedding dimension: {embedding_dim}")
+        logger.info(f"Initializing memory store (embedding_dim={embedding_dim})...")
+        memory = MemoryStore(
+            db_path=MemoryConfig.DB_PATH,
+            max_memories=MemoryConfig.MAX_MEMORIES,
+            embedding_dim=embedding_dim,
+            identity=DEFAULT_IDENTITY
+        )
+    else:
+        embedding_dim = memory.embedding_dim
+    
     logger.info(f"{LogConfig.CHECK} Memory store initialized")
+    
+    # Initialize tool executor
+    tool_executor = ToolExecutor(registry)
+    logger.info(f"{LogConfig.CHECK} Tool executor initialized ({len(registry.get_tools())} tools available)")
     
     # Initialize SNN
     logger.info("Initializing SNN compute...")
@@ -220,14 +252,25 @@ async def websocket_endpoint(websocket: WebSocket):
 async def _process_prompt(prompt: str) -> dict:
     """Process a user prompt and return response data"""
     try:
+        # Pre-process hooks
+        hook_context = {"prompt": prompt}
+        processed_prompt = prompt
+        if registry and registry.processing_hooks:
+            for hook in registry.processing_hooks:
+                try:
+                    processed_prompt = await hook.pre_process(processed_prompt, hook_context)
+                except Exception as e:
+                    logger.error(f"Pre-process hook error: {e}")
+                    await hook.on_error(e, hook_context)
+        
         # Extract embedding
-        embedding = phi3.get_embedding(prompt)
+        embedding = phi3.get_embedding(processed_prompt)
         
         # Process through brain module (emotional intelligence)
         brain_result = None
         emotional_context = ""
         if brain is not None:
-            brain_result = brain.process(prompt, embedding)
+            brain_result = brain.process(processed_prompt, embedding)
             
             # Get empathy-aware prompt prefix
             emotional_context = brain.get_empathy_prompt()
@@ -236,19 +279,29 @@ async def _process_prompt(prompt: str) -> dict:
             response_style = brain.get_response_style()
         
         # Store in memory
-        memory.store(embedding, prompt)
+        memory.store(embedding, processed_prompt)
         
         # Retrieve similar memories (identity automatically included)
         context = memory.retrieve(embedding, k=MemoryConfig.DEFAULT_K)
         
         # Build enhanced prompt with emotional context
         if emotional_context:
-            enhanced_prompt = f"{emotional_context}\n\nUser: {prompt}"
+            enhanced_prompt = f"{emotional_context}\n\nUser: {processed_prompt}"
         else:
-            enhanced_prompt = prompt
+            enhanced_prompt = processed_prompt
         
-        # Generate response with context
-        response_text = phi3.generate(enhanced_prompt, context)
+        # Generate response with context and tools
+        tools = registry.get_tools() if registry else []
+        if tools and tool_executor:
+            response_text = phi3.generate_with_tools(
+                enhanced_prompt,
+                context,
+                tools=tools,
+                tool_executor=tool_executor,
+                max_iterations=5
+            )
+        else:
+            response_text = phi3.generate(enhanced_prompt, context)
         
         # Provide feedback to brain for learning
         if brain is not None and brain_result is not None:
@@ -285,6 +338,15 @@ async def _process_prompt(prompt: str) -> dict:
                 "spatial_context": brain_result.get('spatial_context', {}),
                 "modulation": brain_result['modulation']
             }
+        
+        # Post-process hooks
+        if registry and registry.processing_hooks:
+            for hook in registry.processing_hooks:
+                try:
+                    response_data = await hook.post_process(response_data, hook_context)
+                except Exception as e:
+                    logger.error(f"Post-process hook error: {e}")
+                    await hook.on_error(e, hook_context)
         
         return response_data
         

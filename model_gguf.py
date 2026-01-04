@@ -223,3 +223,83 @@ class Phi3GGUF:
         except Exception as e:
             logger.error(f"Generation error: {e}")
             return f"[Error during generation: {str(e)}]"
+    
+    def generate_with_tools(
+        self,
+        prompt: str,
+        context: List[str],
+        tools,
+        tool_executor,
+        max_iterations: int = 5
+    ) -> str:
+        """
+        Generate response with tool calling support.
+        
+        This implementation performs iterative tool calling:
+        1. Generate initial response
+        2. Parse tool calls from response
+        3. Execute tools
+        4. Inject results and regenerate
+        5. Repeat until no more tool calls or max_iterations reached
+        
+        Args:
+            prompt: User prompt
+            context: List of retrieved memory texts
+            tools: List of available tools
+            tool_executor: ToolExecutor instance
+            max_iterations: Maximum number of tool calling iterations
+            
+        Returns:
+            Final generated response
+        """
+        import json
+        from modules.tools import ToolCall
+        
+        # Build initial prompt with tool descriptions
+        tool_descriptions = []
+        for tool in tools:
+            tool_descriptions.append(
+                f"Tool: {tool.name}\n"
+                f"Description: {tool.description}\n"
+                f"Parameters: {json.dumps(tool.parameters, indent=2)}\n"
+            )
+        
+        tool_prompt = "\n\nAvailable Tools:\n" + "\n".join(tool_descriptions)
+        tool_prompt += "\n\nTo call a tool, output JSON in this format:\n"
+        tool_prompt += '{"tool": "tool_name", "parameters": {...}}\n'
+        tool_prompt += "Or for multiple tools:\n"
+        tool_prompt += '[{"tool": "tool_name1", "parameters": {...}}, {"tool": "tool_name2", "parameters": {...}}]\n'
+        
+        current_prompt = prompt
+        iteration = 0
+        
+        while iteration < max_iterations:
+            # Generate response
+            response = self.generate(current_prompt, context)
+            
+            # Parse tool calls
+            tool_calls = tool_executor.parse_tool_calls(response)
+            
+            if not tool_calls:
+                # No tool calls, return final response
+                return response
+            
+            # Execute tools
+            import asyncio
+            results = asyncio.run(tool_executor.execute_tool_chain(tool_calls))
+            
+            # Format tool results
+            tool_results = tool_executor.format_tool_results(results)
+            
+            # Build next prompt with tool results
+            current_prompt = (
+                f"{prompt}\n\n"
+                f"Previous response: {response}\n\n"
+                f"{tool_results}\n\n"
+                "Continue with the final response using the tool results above:"
+            )
+            
+            iteration += 1
+        
+        # Max iterations reached, return last response
+        return response

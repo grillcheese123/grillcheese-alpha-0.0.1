@@ -107,6 +107,22 @@ class LogConfig:
     WARNING = "[!]"
 
 
+# Module configuration
+class ModuleConfig:
+    """Configuration for plugin/module system"""
+    MODULES_DIR = BASE_DIR / "modules"
+    MODULES_CONFIG_FILE = MODULES_DIR / "modules_config.json"
+    AUTO_DISCOVER = True
+    DEFAULT_MEMORY_BACKEND = "sqlite_faiss"  # or plugin name
+    DEFAULT_MODEL_PROVIDER = "gguf"  # or plugin name
+    
+    # Plugin directory structure
+    OFFICIAL_DIR = MODULES_DIR / "official"
+    CORE_DIR = MODULES_DIR / "core"
+    COMMUNITY_DIR = MODULES_DIR / "community"
+    MARKETPLACE_DIR = MODULES_DIR / "marketplace"
+
+
 # Helper function to find GGUF model
 def find_gguf_model() -> str | None:
     """Find first available GGUF model file"""

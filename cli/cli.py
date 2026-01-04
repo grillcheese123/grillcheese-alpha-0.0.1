@@ -22,6 +22,8 @@ from config import MemoryConfig, SNNConfig, LogConfig, ModelConfig, find_gguf_mo
 from memory_store import MemoryStore
 from identity import DEFAULT_IDENTITY
 from vulkan_backend import SNNCompute
+from modules.registry import ModuleRegistry
+from modules.tools import ToolExecutor
 
 # Configure logging
 logging.basicConfig(level=LogConfig.LEVEL, format=LogConfig.FORMAT)
@@ -153,28 +155,61 @@ Examples:
     # Initialize system
     print("Initializing GrillCheese AI...")
     
-    # Load model
-    phi3 = _init_model()
+    # Load plugins and modules
+    print("Loading plugins and modules...")
+    try:
+        registry = ModuleRegistry()
+        asyncio.run(registry.load_all_modules())
+        print(f"{LogConfig.CHECK} Plugins loaded")
+    except Exception as e:
+        logger.warning(f"Failed to load plugins: {e}, continuing with defaults")
+        registry = None
+    
+    # Load model (from registry or fallback)
+    phi3 = None
+    if registry:
+        phi3 = registry.get_active_model_provider()
+    
     if phi3 is None:
-        print(f"{LogConfig.CROSS} No model available")
-        sys.exit(1)
+        phi3 = _init_model()
+        if phi3 is None:
+            print(f"{LogConfig.CROSS} No model available")
+            sys.exit(1)
     
     # Get embedding dimension from model (auto-detected)
     embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
     logger.info(f"Detected embedding dimension: {embedding_dim}")
     
-    # Initialize memory store
+    # Initialize memory store (from registry or fallback)
     print("Initializing memory store...")
     try:
-        memory = MemoryStore(
-            db_path=args.db,
-            embedding_dim=embedding_dim,
-            identity=DEFAULT_IDENTITY
-        )
+        if registry:
+            memory = registry.get_active_memory_backend()
+            if memory is None:
+                # Fallback to direct initialization
+                memory = MemoryStore(
+                    db_path=args.db,
+                    embedding_dim=embedding_dim,
+                    identity=DEFAULT_IDENTITY
+                )
+        else:
+            memory = MemoryStore(
+                db_path=args.db,
+                embedding_dim=embedding_dim,
+                identity=DEFAULT_IDENTITY
+            )
         print(f"{LogConfig.CHECK} Memory store initialized")
     except Exception as e:
         print(f"{LogConfig.CROSS} Failed to initialize memory store: {e}")
         sys.exit(1)
+    
+    # Initialize tool executor
+    tool_executor = None
+    if registry:
+        tool_executor = ToolExecutor(registry)
+        tools_count = len(registry.get_tools())
+        if tools_count > 0:
+            print(f"{LogConfig.CHECK} Tool executor initialized ({tools_count} tools available)")
     
     # Initialize SNN
     print("Initializing GPU backend...")
@@ -286,11 +321,11 @@ Examples:
     # Interactive mode or single prompt
     elif args.interactive or (not prompt and not args.stats):
         if learner:
-            asyncio.run(_interactive_mode_async(phi3, memory, snn, learner, brain))
+            asyncio.run(_interactive_mode_async(phi3, memory, snn, learner, brain, registry, tool_executor))
         else:
-            _interactive_mode(phi3, memory, snn, brain)
+            _interactive_mode(phi3, memory, snn, brain, registry, tool_executor)
     elif prompt:
-        _process_prompt(phi3, memory, snn, prompt, learner, brain)
+        _process_prompt(phi3, memory, snn, prompt, learner, brain, registry, tool_executor)
     else:
         print("Error: No prompt provided. Use --interactive for interactive mode.")
         parser.print_help()
@@ -405,14 +440,25 @@ def _show_learning_stats(learner):
     print(f"Total weight: {stdp_stats.get('total_weight', 0):.4f}")
 
 
-def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, learner=None, brain=None):
+def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, learner=None, brain=None, registry=None, tool_executor=None):
     """Process a single prompt and print response"""
     print(f"\nYou: {prompt}\n")
     
     try:
+        # Pre-process hooks
+        hook_context = {"prompt": prompt}
+        processed_prompt = prompt
+        if registry and registry.processing_hooks:
+            for hook in registry.processing_hooks:
+                try:
+                    processed_prompt = asyncio.run(hook.pre_process(processed_prompt, hook_context))
+                except Exception as e:
+                    logger.error(f"Pre-process hook error: {e}")
+                    asyncio.run(hook.on_error(e, hook_context))
+        
         # Extract embedding
         print("Extracting embedding...", end="\r")
-        embedding = phi3.get_embedding(prompt)
+        embedding = phi3.get_embedding(processed_prompt)
         print(f"{LogConfig.CHECK} Embedding extracted    ")
         
         # Process through brain module (emotional intelligence)
@@ -426,7 +472,7 @@ def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, lea
         
         # Store in memory
         print("Storing in memory...", end="\r")
-        memory.store(embedding, prompt)
+        memory.store(embedding, processed_prompt)
         print(f"{LogConfig.CHECK} Stored in memory      ")
         
         # Retrieve context
@@ -438,18 +484,28 @@ def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, lea
         if brain is not None:
             self_awareness = brain.get_self_awareness_prompt()
             if emotional_context:
-                enhanced_prompt = f"{self_awareness}\n\n{emotional_context}\n\nUser: {prompt}"
+                enhanced_prompt = f"{self_awareness}\n\n{emotional_context}\n\nUser: {processed_prompt}"
             else:
-                enhanced_prompt = f"{self_awareness}\n\nUser: {prompt}"
+                enhanced_prompt = f"{self_awareness}\n\nUser: {processed_prompt}"
         elif emotional_context:
-            enhanced_prompt = f"{emotional_context}\n\nUser: {prompt}"
+            enhanced_prompt = f"{emotional_context}\n\nUser: {processed_prompt}"
         else:
-            enhanced_prompt = prompt
+            enhanced_prompt = processed_prompt
         
-        # Generate response
-        device_msg = "GPU" if phi3.device != "cpu" else "CPU"
+        # Generate response (with tools if available)
+        device_msg = "GPU" if hasattr(phi3, 'device') and phi3.device != "cpu" else "CPU"
         print(f"Generating response on {device_msg}...")
-        response = phi3.generate(enhanced_prompt, context)
+        tools = registry.get_tools() if registry else []
+        if tools and tool_executor:
+            response = phi3.generate_with_tools(
+                enhanced_prompt,
+                context,
+                tools=tools,
+                tool_executor=tool_executor,
+                max_iterations=5
+            )
+        else:
+            response = phi3.generate(enhanced_prompt, context)
         print(f"{LogConfig.CHECK} Response generated")
         
         # Provide feedback to brain
@@ -502,7 +558,7 @@ def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, lea
         sys.exit(1)
 
 
-def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
+def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None, registry=None, tool_executor=None):
     """Interactive conversation mode with emotional intelligence"""
     print("\n" + "=" * 60)
     print("GrillCheese AI - Interactive Mode")
@@ -628,7 +684,7 @@ def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
             traceback.print_exc()
 
 
-async def _interactive_mode_async(phi3, memory: MemoryStore, snn: SNNCompute, learner, brain=None):
+async def _interactive_mode_async(phi3, memory: MemoryStore, snn: SNNCompute, learner, brain=None, registry=None, tool_executor=None):
     """Interactive conversation mode with continuous learning and emotional intelligence"""
     print("\n" + "=" * 60)
     print("GrillCheese AI - Interactive Mode")
