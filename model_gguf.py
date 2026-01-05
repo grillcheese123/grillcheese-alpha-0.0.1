@@ -99,15 +99,6 @@ class Phi3GGUF:
     
     def _init_embedding_model(self):
         """Initialize sentence-transformers for proper semantic embeddings"""
-        if not SENTENCE_TRANSFORMERS_AVAILABLE:
-            logger.warning(
-                f"{LogConfig.WARNING} sentence-transformers not available. "
-                "Install with: pip install sentence-transformers\n"
-                "Falling back to hash-based embeddings (not recommended for production)"
-            )
-            self.embedder = None
-            self.embedding_dim = ModelConfig.PHI3_EMBEDDING_DIM  # Fallback dimension
-            return
         
         try:
             logger.info(f"Loading embedding model: {ModelConfig.SENTENCE_TRANSFORMER_MODEL}")

@@ -22,6 +22,9 @@ from config import MemoryConfig, SNNConfig, LogConfig, ModelConfig, find_gguf_mo
 from memory_store import MemoryStore
 from identity import DEFAULT_IDENTITY
 from vulkan_backend import SNNCompute
+from learning.multimodal_encoder import MultimodalEncoder
+from learning.multilingual_utils import MultilingualProcessor
+from learning.knowledge_distillation import KnowledgeDistillation
 
 # Configure logging
 logging.basicConfig(level=LogConfig.LEVEL, format=LogConfig.FORMAT)
