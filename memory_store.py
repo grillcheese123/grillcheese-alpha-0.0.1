@@ -10,7 +10,7 @@ import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Callable
 
 from config import MemoryConfig, LogConfig
 
@@ -27,7 +27,8 @@ class MemoryStore:
         db_path: str = MemoryConfig.DB_PATH,
         max_memories: int = MemoryConfig.MAX_MEMORIES,
         embedding_dim: int = MemoryConfig.EMBEDDING_DIM,
-        identity: Optional[str] = None
+        identity: Optional[str] = None,
+        use_hilbert: bool = None
     ):
         """
         Initialize memory store
@@ -37,11 +38,33 @@ class MemoryStore:
             max_memories: Maximum number of memories to store
             embedding_dim: Dimension of embeddings
             identity: Optional initial identity text for the AI
+            use_hilbert: Enable Hilbert Multiverse Routing (default: from MemoryConfig)
         """
         self.db_path = Path(db_path)
         self.max_memories = max_memories
         self.embedding_dim = embedding_dim
         self.identity_text = identity
+        
+        # Hilbert routing (optional enhancement)
+        if use_hilbert is None:
+            use_hilbert = MemoryConfig.USE_HILBERT_ROUTING
+        self.use_hilbert = use_hilbert
+        self.hilbert_store = None
+        
+        if self.use_hilbert:
+            try:
+                from hilbert_routing import HilbertMemoryStore
+                self.hilbert_store = HilbertMemoryStore(
+                    embedding_dim=self.embedding_dim,
+                    universe=MemoryConfig.HILBERT_UNIVERSE
+                )
+                logger.info(f"{LogConfig.CHECK} Hilbert Multiverse Routing enabled (universe: {MemoryConfig.HILBERT_UNIVERSE})")
+            except ImportError as e:
+                logger.warning(f"{LogConfig.WARNING} Hilbert routing not available: {e}, using standard similarity")
+                self.use_hilbert = False
+            except Exception as e:
+                logger.warning(f"{LogConfig.WARNING} Hilbert routing init failed: {e}, using standard similarity")
+                self.use_hilbert = False
         
         # Initialize GPU backend
         try:
@@ -76,6 +99,10 @@ class MemoryStore:
         
         # Load existing memories
         self._load_memories()
+        
+        # Initialize Hilbert store with existing memories if enabled
+        if self.use_hilbert and self.hilbert_store and self.num_memories > 0:
+            self._sync_to_hilbert_store()
         
         # Store identity if provided and not already stored
         if identity and self.identity_index == -1:
@@ -166,6 +193,45 @@ class MemoryStore:
             self.next_write_index = self.num_memories % self.max_memories
         
         logger.info(f"Loaded {self.num_memories} memories into GPU")
+    
+    def _sync_to_hilbert_store(self) -> None:
+        """Sync existing memories to Hilbert store"""
+        if not self.use_hilbert or not self.hilbert_store:
+            return
+        
+        try:
+            for i in range(self.num_memories):
+                if i < len(self.memory_texts):
+                    memory_id = str(i)
+                    embedding = self.memory_keys[i]
+                    text = self.memory_texts[i]
+                    
+                    # Get metadata from database if available
+                    metadata = None
+                    try:
+                        conn = sqlite3.connect(self.db_path)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT metadata FROM memories WHERE id = ?",
+                            (i + 1,)  # SQLite IDs are 1-indexed
+                        )
+                        row = cursor.fetchone()
+                        if row and row[0]:
+                            metadata = json.loads(row[0])
+                        conn.close()
+                    except Exception:
+                        pass
+                    
+                    self.hilbert_store.add_memory(
+                        memory_id=memory_id,
+                        embedding=embedding,
+                        text=text,
+                        metadata=metadata
+                    )
+            
+            logger.debug(f"Synced {self.num_memories} memories to Hilbert store")
+        except Exception as e:
+            logger.warning(f"Failed to sync memories to Hilbert store: {e}")
     
     def set_identity(self, identity_text: str, identity_embedding: Optional[np.ndarray] = None) -> None:
         """
@@ -327,24 +393,45 @@ class MemoryStore:
         else:
             self.memory_texts.append(text)
         
+        # Also add to Hilbert store if enabled
+        if self.use_hilbert and self.hilbert_store:
+            try:
+                memory_id = str(write_index)
+                self.hilbert_store.add_memory(
+                    memory_id=memory_id,
+                    embedding=embedding,
+                    text=text,
+                    metadata=metadata
+                )
+            except Exception as e:
+                logger.debug(f"Hilbert store update failed (non-critical): {e}")
+        
         logger.debug(f"Memory stored at index {write_index}")
     
     def retrieve(
         self,
         query_embedding: np.ndarray,
         k: int = MemoryConfig.DEFAULT_K,
-        include_identity: bool = True
+        include_identity: bool = True,
+        reranker: Optional[Callable[[str, List[str]], List[float]]] = None,
+        query_text: Optional[str] = None,
+        emotion_bias: Optional[Dict[str, float]] = None,
+        temporal_bias: Optional[Dict[int, float]] = None
     ) -> List[str]:
         """
-        Retrieve top-K similar memories using GPU similarity search
+        Retrieve top-K similar memories using GPU similarity search with optional reranking
         
         Args:
             query_embedding: Query embedding vector (embedding_dim,)
             k: Number of memories to retrieve
             include_identity: If True, always include identity memory as first item
+            reranker: Optional function(query_text, candidate_texts) -> scores
+            query_text: Optional query text for reranking
+            emotion_bias: Optional dict mapping memory indices to emotion-based scores
+            temporal_bias: Optional dict mapping memory indices to temporal recency scores
         
         Returns:
-            List of text strings from retrieved memories
+            List of text strings from retrieved memories (reranked if reranker provided)
         """
         if self.num_memories == 0:
             return []
@@ -362,28 +449,85 @@ class MemoryStore:
         if len(query_embedding) != self.embedding_dim:
             raise ValueError(f"Query embedding dimension mismatch: expected {self.embedding_dim}, got {len(query_embedding)}")
         
-        # Get active memory bank
-        active_keys = self.memory_keys[:self.num_memories]
-        
-        # Compute similarities (GPU or CPU)
-        top_k_indices = self._compute_top_k_similarity(query_embedding, active_keys, k_adj)
+        # Use Hilbert routing if enabled
+        if self.use_hilbert and self.hilbert_store:
+            try:
+                # Retrieve more candidates if reranking
+                initial_k = k_adj * 2 if reranker else k_adj
+                
+                # Use Hilbert similarity search
+                hilbert_results = self.hilbert_store.search(query_embedding, k=initial_k)
+                
+                # Convert to indices
+                top_k_indices = []
+                for mem_id, sim, data in hilbert_results:
+                    try:
+                        idx = int(mem_id)
+                        if 0 <= idx < self.num_memories:
+                            top_k_indices.append(idx)
+                    except ValueError:
+                        continue
+                
+                # Fallback to standard if Hilbert didn't return enough results
+                if len(top_k_indices) < k_adj:
+                    logger.debug("Hilbert search returned insufficient results, falling back to standard")
+                    active_keys = self.memory_keys[:self.num_memories]
+                    top_k_indices = self._compute_top_k_similarity(query_embedding, active_keys, initial_k)
+            except Exception as e:
+                logger.warning(f"Hilbert search failed: {e}, falling back to standard similarity")
+                active_keys = self.memory_keys[:self.num_memories]
+                initial_k = k_adj * 2 if reranker else k_adj
+                top_k_indices = self._compute_top_k_similarity(query_embedding, active_keys, initial_k)
+        else:
+            # Standard similarity search
+            active_keys = self.memory_keys[:self.num_memories]
+            initial_k = k_adj * 2 if reranker else k_adj
+            top_k_indices = self._compute_top_k_similarity(query_embedding, active_keys, initial_k)
         
         # Exclude identity from top-K if we're including it separately
         if include_identity and self.identity_index >= 0:
             top_k_indices = [idx for idx in top_k_indices if idx != self.identity_index]
         
+        # Get candidate texts
+        candidate_texts = [
+            self.memory_texts[idx] 
+            for idx in top_k_indices 
+            if idx < len(self.memory_texts)
+        ]
+        candidate_indices = [idx for idx in top_k_indices if idx < len(self.memory_texts)]
+        
+        # Apply reranking if provided
+        if reranker and query_text and candidate_texts:
+            try:
+                rerank_scores = reranker(query_text, candidate_texts)
+                if len(rerank_scores) == len(candidate_texts):
+                    # Apply emotion and temporal bias if provided
+                    final_scores = []
+                    for i, (text, idx) in enumerate(zip(candidate_texts, candidate_indices)):
+                        score = rerank_scores[i]
+                        # Apply emotion bias
+                        if emotion_bias and idx in emotion_bias:
+                            score += emotion_bias[idx] * 0.2  # 20% weight
+                        # Apply temporal bias
+                        if temporal_bias and idx in temporal_bias:
+                            score += temporal_bias[idx] * 0.1  # 10% weight
+                        final_scores.append((score, text, idx))
+                    
+                    # Sort by final score and take top k
+                    final_scores.sort(reverse=True, key=lambda x: x[0])
+                    candidate_texts = [text for _, text, _ in final_scores[:k_adj]]
+                    candidate_indices = [idx for _, _, idx in final_scores[:k_adj]]
+            except Exception as e:
+                logger.warning(f"Reranking failed: {e}, using original ranking")
+        
         # Build result list
         retrieved_texts = []
         if include_identity and identity_text:
             retrieved_texts.append(identity_text)
-        retrieved_texts.extend([
-            self.memory_texts[idx] 
-            for idx in top_k_indices 
-            if idx < len(self.memory_texts)
-        ])
+        retrieved_texts.extend(candidate_texts)
         
         # Update access statistics
-        self._update_access_stats(top_k_indices)
+        self._update_access_stats(candidate_indices)
         
         return retrieved_texts
     
@@ -596,6 +740,11 @@ class MemoryStore:
         self.memory_texts = []
         self.num_memories = 0
         self.next_write_index = 0
+        
+        # Clear Hilbert store if enabled
+        if self.use_hilbert and self.hilbert_store:
+            self.hilbert_store.memories.clear()
+            self.hilbert_store.psi_cache.clear()
         
         # Reload protected memories if any
         if not include_protected:

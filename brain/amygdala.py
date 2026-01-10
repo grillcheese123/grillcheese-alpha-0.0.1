@@ -36,24 +36,39 @@ class EmotionalState:
         valence: -1.0 (negative) to 1.0 (positive)
         dominant_emotion: Current primary emotion label
         confidence: Confidence in emotion detection
+        cause: What triggered this emotional state (text/context)
+        detected_emotions: List of emotion words detected in the input
     """
     arousal: float = 0.5
     valence: float = 0.0
     dominant_emotion: str = "neutral"
     confidence: float = 0.5
     timestamp: float = 0.0
+    cause: str = ""
+    detected_emotions: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             'arousal': self.arousal,
             'valence': self.valence,
             'dominant_emotion': self.dominant_emotion,
-            'confidence': self.confidence
+            'confidence': self.confidence,
+            'cause': self.cause,
+            'detected_emotions': self.detected_emotions
         }
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'EmotionalState':
-        return cls(**data)
+        # Handle missing fields for backward compatibility
+        return cls(
+            arousal=data.get('arousal', 0.5),
+            valence=data.get('valence', 0.0),
+            dominant_emotion=data.get('dominant_emotion', 'neutral'),
+            confidence=data.get('confidence', 0.5),
+            timestamp=data.get('timestamp', 0.0),
+            cause=data.get('cause', ''),
+            detected_emotions=data.get('detected_emotions', [])
+        )
 
 
 # Emotion words mapped to (valence, arousal) coordinates
@@ -159,6 +174,10 @@ class Amygdala:
         # Learned emotion associations (embedding patterns)
         self.positive_patterns: List[np.ndarray] = []
         self.negative_patterns: List[np.ndarray] = []
+        
+        # Learned emotion lexicon (user-defined emotion labels)
+        # Maps emotion word -> (valence, arousal)
+        self.learned_emotion_lexicon: Dict[str, Tuple[float, float]] = {}
         
         # 3-Layer MLP for affect prediction
         # Layer 1: embedding_dim -> hidden_dim
@@ -268,11 +287,36 @@ class Amygdala:
         arousal = np.clip(arousal * self.sensitivity, 0.0, 1.0)
         
         # 5. Temporal smoothing with decay
-        valence = self.emotion_decay * self.state.valence + (1 - self.emotion_decay) * valence
-        arousal = self.emotion_decay * self.state.arousal + (1 - self.emotion_decay) * arousal
+        # Use exponential moving average, but ensure new emotions have sufficient weight
+        # If new emotion is significantly different, give it more weight
+        old_valence = self.state.valence
+        old_arousal = self.state.arousal
+        
+        # Adaptive decay: if emotion changed significantly, reduce decay to allow faster adaptation
+        valence_diff = abs(valence - old_valence)
+        arousal_diff = abs(arousal - old_arousal)
+        
+        # Reduce decay if emotion changed significantly (allows faster adaptation)
+        adaptive_decay = self.emotion_decay
+        if valence_diff > 0.3 or arousal_diff > 0.3:
+            adaptive_decay = max(0.3, self.emotion_decay - 0.2)  # Faster adaptation for strong changes
+        
+        valence = adaptive_decay * old_valence + (1 - adaptive_decay) * valence
+        arousal = adaptive_decay * old_arousal + (1 - adaptive_decay) * arousal
         
         # 6. Determine dominant emotion
         dominant = self._classify_emotion(valence, arousal)
+        
+        # 6b. Determine cause - what triggered this emotion
+        # Use the input text, but summarize if too long
+        cause_text = text[:200] if len(text) > 200 else text
+        if not cause_text.strip():
+            cause_text = "Recent interaction context"
+        
+        # Extract key emotion words/phrases that contributed
+        emotion_causes = []
+        if detected_emotions:
+            emotion_causes = detected_emotions[:3]  # Top 3 emotion words detected
         
         # 7. Update state
         import time
@@ -281,7 +325,9 @@ class Amygdala:
             valence=valence,
             dominant_emotion=dominant,
             confidence=confidence,
-            timestamp=time.time()
+            timestamp=time.time(),
+            cause=cause_text,
+            detected_emotions=emotion_causes
         )
         
         self.state = new_state
@@ -339,22 +385,27 @@ class Amygdala:
         arousal = 0.5
         
         # Strategy 2: Compare to learned positive patterns
+        positive_contrib = 0.0
         for pattern in self.positive_patterns[-20:]:  # Recent patterns
             similarity = np.dot(embedding, pattern) / (
                 np.linalg.norm(embedding) * np.linalg.norm(pattern) + 1e-8
             )
-            valence += similarity * 0.1
+            positive_contrib += similarity * 0.15  # Increased from 0.1 to 0.15
         
         # Compare to learned negative patterns
+        negative_contrib = 0.0
         for pattern in self.negative_patterns[-20:]:
             similarity = np.dot(embedding, pattern) / (
                 np.linalg.norm(embedding) * np.linalg.norm(pattern) + 1e-8
             )
-            valence -= similarity * 0.1
+            negative_contrib += similarity * 0.15  # Increased from 0.1 to 0.15
         
-        # Strategy 3: Arousal from embedding magnitude
+        valence = positive_contrib - negative_contrib
+        
+        # Strategy 3: Arousal from embedding magnitude and variance
         magnitude = np.linalg.norm(embedding)
-        arousal = 0.3 + 0.4 * np.tanh(magnitude / 10.0)
+        variance = np.var(embedding)  # Higher variance = more complex/arousing content
+        arousal = 0.3 + 0.3 * np.tanh(magnitude / 10.0) + 0.2 * np.tanh(variance * 10.0)
         
         return np.clip(valence, -1.0, 1.0), np.clip(arousal, 0.0, 1.0)
     
@@ -391,6 +442,8 @@ class Amygdala:
         """
         Forward pass through 3-layer MLP for batch processing
         
+        Uses GPU acceleration when available for large batches.
+        
         Args:
             embeddings: [batch, embedding_dim]
             apply_output_activation: Whether to apply tanh/sigmoid
@@ -401,6 +454,47 @@ class Amygdala:
         """
         batch_size = embeddings.shape[0]
         
+        # Try GPU forward pass if available and batch is large enough
+        if self.use_gpu and hasattr(self, 'vulkan') and self.vulkan is not None and batch_size > 4:
+            try:
+                predictions, h1, h2 = self.vulkan.affect_mlp_forward(
+                    embeddings=embeddings,
+                    w1=self.W1.T,  # Shader expects (hidden1_dim, embedding_dim)
+                    b1=self.b1,
+                    w2=self.W2.T,  # Shader expects (hidden2_dim, hidden1_dim)
+                    b2=self.b2,
+                    w3=self.W3.T,  # Shader expects (2, hidden2_dim)
+                    b3=self.b3,
+                    leaky_slope=self.leaky_slope,
+                    apply_output_activation=apply_output_activation,
+                    dropout_rate=self.dropout_rate if training else 0.0
+                )
+                
+                # Reconstruct intermediate values for backprop compatibility
+                # Note: GPU shader doesn't return pre-activations, so we approximate
+                h1_pre = h1 / np.where(h1 > 0, 1.0, self.leaky_slope)  # Approximate inverse
+                h2_pre = h2 / np.where(h2 > 0, 1.0, self.leaky_slope)
+                
+                # Recompute output from h2 for consistency
+                output = np.dot(h2, self.W3.T) + self.b3
+                if not apply_output_activation:
+                    predictions = output.copy()
+                
+                return {
+                    'h1_pre': h1_pre,
+                    'h1': h1,
+                    'h2_pre': h2_pre,
+                    'h2': h2,
+                    'output': output,
+                    'predictions': predictions,
+                    'mask1': None,  # GPU handles dropout internally
+                    'mask2': None,
+                    'gpu_accelerated': True
+                }
+            except Exception as e:
+                logger.debug(f"GPU forward MLP failed: {e}, using CPU")
+        
+        # CPU implementation (original)
         # Layer 1: Linear + LeakyReLU
         h1_pre = np.dot(embeddings, self.W1.T) + self.b1  # [batch, hidden]
         h1 = np.where(h1_pre > 0, h1_pre, self.leaky_slope * h1_pre)
@@ -449,19 +543,51 @@ class Amygdala:
         best_emotion = "neutral"
         best_score = float('inf')
         
+        # First check learned emotions (user-defined, higher priority)
+        for emotion, (learned_val, learned_aro) in self.learned_emotion_lexicon.items():
+            # Distance to learned emotion coordinates
+            dist = (arousal - learned_aro)**2 + (valence - learned_val)**2
+            if dist < best_score:
+                best_score = dist
+                best_emotion = emotion
+        
+        # Then check standard emotion quadrants
         for emotion, (aro_min, aro_max, val_min, val_max) in EMOTION_QUADRANTS.items():
+            # Skip if already found a learned emotion that's closer
+            if best_score < 0.1:  # Very close match in learned emotions
+                break
             # Check if in quadrant
             if aro_min <= arousal <= aro_max and val_min <= valence <= val_max:
                 # Distance to center of quadrant
                 aro_center = (aro_min + aro_max) / 2
                 val_center = (val_min + val_max) / 2
                 dist = (arousal - aro_center)**2 + (valence - val_center)**2
-                
                 if dist < best_score:
                     best_score = dist
                     best_emotion = emotion
         
         return best_emotion
+    
+    def learn_emotion_label(self, emotion_word: str, valence: float, arousal: float) -> bool:
+        """
+        Learn a new emotion label from user input
+        
+        Args:
+            emotion_word: The emotion word/label to learn (e.g., "powerful")
+            valence: Current valence value to associate with this emotion
+            arousal: Current arousal value to associate with this emotion
+            
+        Returns:
+            True if learned successfully
+        """
+        emotion_word = emotion_word.lower().strip()
+        if not emotion_word:
+            return False
+        
+        # Store the learned emotion
+        self.learned_emotion_lexicon[emotion_word] = (valence, arousal)
+        logger.info(f"Learned new emotion label: '{emotion_word}' -> (valence={valence:.2f}, arousal={arousal:.2f})")
+        return True
     
     def _learn_pattern(self, embedding: np.ndarray, valence: float) -> None:
         """Learn emotional association with embedding"""
@@ -534,6 +660,7 @@ class Amygdala:
             'stats': self.stats,
             'positive_patterns': [p.tolist() for p in self.positive_patterns],
             'negative_patterns': [p.tolist() for p in self.negative_patterns],
+            'learned_emotion_lexicon': {k: list(v) for k, v in self.learned_emotion_lexicon.items()},
             # 3-layer MLP weights
             'W1': self.W1.tolist(),
             'b1': self.b1.tolist(),
@@ -571,6 +698,9 @@ class Amygdala:
         self.stats = state_dict['stats']
         self.positive_patterns = [np.array(p) for p in state_dict.get('positive_patterns', [])]
         self.negative_patterns = [np.array(p) for p in state_dict.get('negative_patterns', [])]
+        # Load learned emotion lexicon
+        learned_emotions = state_dict.get('learned_emotion_lexicon', {})
+        self.learned_emotion_lexicon = {k: tuple(v) for k, v in learned_emotions.items()}
         
         # Load 3-layer MLP weights (new format)
         if 'W3' in state_dict:
@@ -905,6 +1035,70 @@ class Amygdala:
     def _adam_update(self, name: str, param: np.ndarray, grad: np.ndarray, lr: float,
                      beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8,
                      weight_decay: float = 0.0001) -> None:
+        """
+        Adam optimizer update with GPU acceleration when available
+        """
+        # Try GPU Adam if available and parameter is large enough
+        if self.use_gpu and hasattr(self, 'vulkan') and self.vulkan is not None and len(param.flatten()) > 100:
+            try:
+                # Get or initialize Adam moments
+                if not hasattr(self, '_adam_moments'):
+                    self._adam_moments = {}
+                
+                if name not in self._adam_moments:
+                    self._adam_moments[name] = {
+                        'm': np.zeros_like(param),
+                        'v': np.zeros_like(param)
+                    }
+                
+                moments = self._adam_moments[name]
+                
+                # Use GPU Adam update
+                updated_param, updated_m, updated_v = self.vulkan.affect_adam_update(
+                    weights=param.flatten(),
+                    gradients=grad.flatten(),
+                    moment1=moments['m'].flatten(),
+                    moment2=moments['v'].flatten(),
+                    learning_rate=lr,
+                    timestep=self.adam_t,
+                    beta1=beta1,
+                    beta2=beta2,
+                    epsilon=eps,
+                    weight_decay=weight_decay
+                )
+                
+                # Update parameter and moments
+                param[:] = updated_param.reshape(param.shape)
+                moments['m'][:] = updated_m.reshape(param.shape)
+                moments['v'][:] = updated_v.reshape(param.shape)
+                return
+            except Exception as e:
+                logger.debug(f"GPU Adam failed for {name}: {e}, using CPU")
+        
+        # CPU implementation (original)
+        # Add weight decay
+        grad = grad + weight_decay * param
+        
+        # Initialize moments if needed
+        if not hasattr(self, 'adam_m'):
+            self.adam_m = {}
+            self.adam_v = {}
+        
+        if name not in self.adam_m:
+            self.adam_m[name] = np.zeros_like(param)
+            self.adam_v[name] = np.zeros_like(param)
+        
+        # Update moments
+        self.adam_m[name] = beta1 * self.adam_m[name] + (1 - beta1) * grad
+        self.adam_v[name] = beta2 * self.adam_v[name] + (1 - beta2) * (grad ** 2)
+        
+        # Bias correction
+        t = self.adam_t + 1
+        m_hat = self.adam_m[name] / (1 - beta1 ** t)
+        v_hat = self.adam_v[name] / (1 - beta2 ** t)
+        
+        # Update parameter in-place
+        param -= lr * m_hat / (np.sqrt(v_hat) + eps)
         """Apply Adam optimizer update to a parameter"""
         # Add weight decay
         grad = grad + weight_decay * param

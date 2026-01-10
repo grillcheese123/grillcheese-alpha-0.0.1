@@ -257,51 +257,10 @@ class GPUBrainCompute:
         
         if self.use_vulkan and self.vulkan:
             try:
-                total_elements = batch_size * seq_len * embedding_dim
-                
-                pos_buf = self.vulkan.create_buffer(
-                    positions.flatten().astype(np.float32).tobytes(),
-                    usage='storage'
-                )
-                out_buf = self.vulkan.create_buffer(
-                    total_elements * 4,
-                    usage='storage'
-                )
-                theta_buf = self.vulkan.create_buffer(
-                    theta_phase_offsets.astype(np.float32).tobytes(),
-                    usage='storage'
-                )
-                gamma_buf = self.vulkan.create_buffer(
-                    gamma_phase_offsets.astype(np.float32).tobytes(),
-                    usage='storage'
-                )
-                amp_buf = self.vulkan.create_buffer(
-                    amplitude_mod.astype(np.float32).tobytes(),
-                    usage='storage'
-                )
-                
-                pipeline = self.vulkan.create_pipeline('theta-gamma-encoding')
-                
-                max_seq_len = max(seq_len, 512)
-                push_constants = np.array([
-                    batch_size, seq_len, embedding_dim,
-                    theta_freq, gamma_freq, max_seq_len
-                ], dtype=np.float32)
-                
-                self.vulkan.dispatch(
-                    pipeline,
-                    [pos_buf, out_buf, theta_buf, gamma_buf, amp_buf],
-                    push_constants.tobytes(),
-                    groups=((total_elements + 255) // 256, 1, 1)
-                )
-                
-                result = np.frombuffer(
-                    self.vulkan.read_buffer(out_buf),
-                    dtype=np.float32
-                ).reshape(batch_size, seq_len, embedding_dim)
-                
-                return result
-                
+                # Use CPU fallback for theta-gamma encoding (not yet implemented in VulkanCompute)
+                # This is a complex operation that would need a dedicated shader
+                logger.debug("Theta-gamma encoding using CPU fallback (GPU implementation not available)")
+                pass  # Fall through to CPU implementation
             except Exception as e:
                 logger.warning(f"GPU theta-gamma encoding failed: {e}")
         
@@ -381,38 +340,14 @@ class GPUBrainCompute:
         
         if self.use_vulkan and self.vulkan:
             try:
-                pre_buf = self.vulkan.create_buffer(
-                    pre_activations.astype(np.float32).tobytes(),
-                    usage='storage'
+                # Use the public hebbian_learning method instead of low-level buffer operations
+                updated = self.vulkan.hebbian_learning(
+                    pre_activations=pre_activations.astype(np.float32),
+                    post_activations=post_activations.astype(np.float32),
+                    weights=weights.astype(np.float32),
+                    learning_rate=learning_rate,
+                    weight_decay=weight_decay
                 )
-                post_buf = self.vulkan.create_buffer(
-                    post_activations.astype(np.float32).tobytes(),
-                    usage='storage'
-                )
-                w_buf = self.vulkan.create_buffer(
-                    weights.astype(np.float32).tobytes(),
-                    usage='storage'
-                )
-                
-                pipeline = self.vulkan.create_pipeline('hebbian-learning')
-                
-                push_constants = np.array([
-                    batch_size, time_steps, pre_dim, post_dim,
-                    learning_rate, weight_decay
-                ], dtype=np.float32)
-                
-                self.vulkan.dispatch(
-                    pipeline,
-                    [pre_buf, post_buf, w_buf],
-                    push_constants.tobytes(),
-                    groups=((pre_dim + 15) // 16, (post_dim + 15) // 16, 1)
-                )
-                
-                updated = np.frombuffer(
-                    self.vulkan.read_buffer(w_buf),
-                    dtype=np.float32
-                ).reshape(post_dim, pre_dim)
-                
                 return updated
                 
             except Exception as e:

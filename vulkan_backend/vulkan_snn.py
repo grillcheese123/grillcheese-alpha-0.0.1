@@ -264,4 +264,174 @@ class VulkanSNN:
         vkFreeMemory(self.core.device, mem_post_trace, None)
         
         return weights_out, pre_trace_out, post_trace_out
+    
+    def gif_neuron_step(
+        self,
+        input_current: np.ndarray,
+        membrane_potential: np.ndarray,
+        adaptation_current: np.ndarray,
+        input_gate: np.ndarray,
+        forget_gate: np.ndarray,
+        refractory_state: np.ndarray,
+        last_spike_time: np.ndarray,
+        dt: float = 0.001,
+        current_time: float = 0.0,
+        tau_mem: float = 20.0,
+        v_rest: float = 0.0,
+        v_reset: float = 0.0,
+        v_thresh: float = 1.0,
+        r_mem: float = 1.0,
+        tau_adapt: float = 100.0,
+        delta_adapt: float = 0.1,
+        b_adapt: float = 0.02,
+        tau_gate: float = 10.0,
+        gate_strength: float = 1.0,
+        t_refrac_period: float = 2.0
+    ) -> tuple:
+        """
+        GPU-accelerated GIF (Generalized Integrate-and-Fire) neuron step
+        
+        GIF neurons have gated dynamics similar to LSTM, allowing for
+        adaptive integration and memory retention.
+        
+        Args:
+            input_current: Input current for each neuron [n_neurons]
+            membrane_potential: Current membrane potential [n_neurons]
+            adaptation_current: Adaptation current state [n_neurons]
+            input_gate: Input gate state [n_neurons]
+            forget_gate: Forget gate state [n_neurons]
+            refractory_state: Refractory counter [n_neurons]
+            last_spike_time: Time of last spike [n_neurons]
+            dt: Time step
+            current_time: Current simulation time
+            tau_mem: Membrane time constant
+            v_rest: Resting potential
+            v_reset: Reset potential
+            v_thresh: Spike threshold
+            r_mem: Membrane resistance
+            tau_adapt: Adaptation time constant
+            delta_adapt: Adaptation increment per spike
+            b_adapt: Adaptation coupling strength
+            tau_gate: Gate time constant
+            gate_strength: Gate modulation strength
+            t_refrac_period: Refractory period duration
+        
+        Returns:
+            Tuple of (spikes, updated_membrane, updated_adaptation, updated_input_gate, updated_forget_gate, updated_refractory, updated_last_spike_time)
+        """
+        n_neurons = len(input_current)
+        
+        # Ensure all arrays are same size and float32
+        I_in = input_current.astype(np.float32).flatten()
+        V_mem = membrane_potential.astype(np.float32).flatten()
+        I_adapt = adaptation_current.astype(np.float32).flatten()
+        g_input = input_gate.astype(np.float32).flatten()
+        g_forget = forget_gate.astype(np.float32).flatten()
+        t_refrac = refractory_state.astype(np.float32).flatten()
+        t_last = last_spike_time.astype(np.float32).flatten()
+        
+        # Output spikes
+        spikes = np.zeros(n_neurons, dtype=np.float32)
+        
+        # Create buffers
+        buf_I, mem_I = self.core._create_buffer(I_in.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_V, mem_V = self.core._create_buffer(V_mem.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_Ia, mem_Ia = self.core._create_buffer(I_adapt.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_gi, mem_gi = self.core._create_buffer(g_input.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_gf, mem_gf = self.core._create_buffer(g_forget.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_tref, mem_tref = self.core._create_buffer(t_refrac.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_spikes, mem_spikes = self.core._create_buffer(spikes.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_tlast, mem_tlast = self.core._create_buffer(t_last.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        
+        # Upload data
+        self.core._upload_buffer(buf_I, mem_I, I_in)
+        self.core._upload_buffer(buf_V, mem_V, V_mem)
+        self.core._upload_buffer(buf_Ia, mem_Ia, I_adapt)
+        self.core._upload_buffer(buf_gi, mem_gi, g_input)
+        self.core._upload_buffer(buf_gf, mem_gf, g_forget)
+        self.core._upload_buffer(buf_tref, mem_tref, t_refrac)
+        self.core._upload_buffer(buf_tlast, mem_tlast, t_last)
+        
+        # Check if shader is available
+        if 'gif-neuron' not in self.shaders:
+            raise RuntimeError(
+                "gif-neuron shader not compiled. "
+                "Run: glslc -fshader-stage=compute shaders/gif-neuron.glsl -o shaders/spv/gif-neuron.spv"
+            )
+        
+        # Get or create pipeline
+        num_bindings = 8  # I_input, V_mem, I_adapt, g_input, g_forget, t_refrac, spikes, t_last_spike
+        pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
+            'gif-neuron', num_bindings, push_constant_size=64
+        )
+        
+        # Create descriptor set
+        descriptor_set = self.pipelines.get_cached_descriptor_set(
+            'gif-neuron',
+            [
+                (buf_I, I_in.nbytes),
+                (buf_V, V_mem.nbytes),
+                (buf_Ia, I_adapt.nbytes),
+                (buf_gi, g_input.nbytes),
+                (buf_gf, g_forget.nbytes),
+                (buf_tref, t_refrac.nbytes),
+                (buf_spikes, spikes.nbytes),
+                (buf_tlast, t_last.nbytes)
+            ]
+        )
+        
+        # Pack push constants
+        push_constants = struct.pack(
+            'Ifffffffffffff',
+            n_neurons,
+            dt, current_time,
+            tau_mem, v_rest, v_reset, v_thresh, r_mem,
+            tau_adapt, delta_adapt, b_adapt,
+            tau_gate, gate_strength,
+            t_refrac_period
+        )
+        
+        # Dispatch
+        workgroups = (n_neurons + 255) // 256
+        self.core._dispatch_compute(
+            pipeline, pipeline_layout, descriptor_set,
+            workgroups, push_constants
+        )
+        
+        # Download results
+        updated_V = self.core._download_buffer(mem_V, V_mem.nbytes, dtype=np.float32)
+        updated_Ia = self.core._download_buffer(mem_Ia, I_adapt.nbytes, dtype=np.float32)
+        updated_gi = self.core._download_buffer(mem_gi, g_input.nbytes, dtype=np.float32)
+        updated_gf = self.core._download_buffer(mem_gf, g_forget.nbytes, dtype=np.float32)
+        updated_tref = self.core._download_buffer(mem_tref, t_refrac.nbytes, dtype=np.float32)
+        updated_spikes = self.core._download_buffer(mem_spikes, spikes.nbytes, dtype=np.float32)
+        updated_tlast = self.core._download_buffer(mem_tlast, t_last.nbytes, dtype=np.float32)
+        
+        # Cleanup
+        vkDestroyBuffer(self.core.device, buf_I, None)
+        vkDestroyBuffer(self.core.device, buf_V, None)
+        vkDestroyBuffer(self.core.device, buf_Ia, None)
+        vkDestroyBuffer(self.core.device, buf_gi, None)
+        vkDestroyBuffer(self.core.device, buf_gf, None)
+        vkDestroyBuffer(self.core.device, buf_tref, None)
+        vkDestroyBuffer(self.core.device, buf_spikes, None)
+        vkDestroyBuffer(self.core.device, buf_tlast, None)
+        vkFreeMemory(self.core.device, mem_I, None)
+        vkFreeMemory(self.core.device, mem_V, None)
+        vkFreeMemory(self.core.device, mem_Ia, None)
+        vkFreeMemory(self.core.device, mem_gi, None)
+        vkFreeMemory(self.core.device, mem_gf, None)
+        vkFreeMemory(self.core.device, mem_tref, None)
+        vkFreeMemory(self.core.device, mem_spikes, None)
+        vkFreeMemory(self.core.device, mem_tlast, None)
+        
+        return (
+            updated_spikes,
+            updated_V,
+            updated_Ia,
+            updated_gi,
+            updated_gf,
+            updated_tref,
+            updated_tlast
+        )
 

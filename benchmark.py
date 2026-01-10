@@ -11,6 +11,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import find_gguf_model
 
+
+def benchmark_embeddings():
+    """Benchmark embedding backends specifically"""
+    print("\n" + "=" * 60)
+    print("EMBEDDING BACKEND BENCHMARK")
+    print("=" * 60)
+    
+    try:
+        from vulkan_embeddings import benchmark_embedders
+        results = benchmark_embedders()
+        return results
+    except ImportError as e:
+        print(f"[!] vulkan_embeddings not available: {e}")
+        return {}
+
+
 def main():
     print("=" * 60)
     print("GrillCheese Inference Benchmark")
@@ -164,6 +180,27 @@ def main():
         print("\n[OK] Good performance. Target of 20+ tokens/sec achieved.")
     else:
         print("\n[!] Below target. Check GPU offloading settings.")
+    
+    # Embedding backend comparison
+    emb_results = benchmark_embeddings()
+    
+    if emb_results:
+        print("\n" + "=" * 60)
+        print("EMBEDDING OPTIMIZATION RECOMMENDATION")
+        print("=" * 60)
+        if "vulkan_llama" in emb_results:
+            if emb_results.get("sentence_transformer", float('inf')) > emb_results.get("vulkan_llama", float('inf')):
+                speedup = emb_results["sentence_transformer"] / emb_results["vulkan_llama"]
+                print(f"[OK] Vulkan embeddings are {speedup:.1f}x faster than CPU!")
+                print("     Your setup is optimized for AMD GPU.")
+            else:
+                print("[!] Vulkan embeddings slower than expected.")
+                print("    Check if a GGUF embedding model is properly loaded.")
+        else:
+            print("[!] Vulkan embeddings not available.")
+            print("    Download a GGUF embedding model to accelerate embeddings:")
+            print("    - nomic-embed-text-v1.5.Q4_K_M.gguf (recommended)")
+            print("    - bge-small-en-v1.5-q4_k_m.gguf (384 dims, compatible)")
 
 
 if __name__ == "__main__":

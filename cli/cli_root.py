@@ -74,7 +74,9 @@ class GrillCheeseCLI:
             memory_store=self.memory,
             embedding_dim=self.embedding_dim,
             state_dir="brain_state",
-            use_gpu=True
+            use_gpu=True,
+            model=None,  # Will be set when model is initialized
+            enable_reranking=False  # Will be enabled after model init
         )
 
         self.encoder = MultimodalEncoder(models_dir="models")
@@ -191,4 +193,4 @@ class GrillCheeseCLI:
         """Clear all memories"""
         self.memory.clear_all()
         print("All memories cleared.")
-        
+

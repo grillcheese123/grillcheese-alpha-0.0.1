@@ -243,4 +243,146 @@ class VulkanFNN:
         vkFreeMemory(self.core.device, mem_sum, None)
         
         return result
+    
+    def xavier_init(self, input_dim: int, output_dim: int, seed: int = 42) -> np.ndarray:
+        """
+        GPU-accelerated Xavier initialization
+        
+        Generates weights from normal distribution scaled by sqrt(2.0 / input_dim)
+        Uses shader: fnn-xavier-init.glsl
+        
+        Args:
+            input_dim: Input dimension
+            output_dim: Output dimension
+            seed: Random seed for reproducibility
+            
+        Returns:
+            Weight matrix (output_dim, input_dim) with Xavier initialization
+        """
+        scale = np.sqrt(2.0 / input_dim)
+        weights_flat = np.zeros(input_dim * output_dim, dtype=np.float32)
+        
+        # Create output buffer
+        buf_weights, mem_weights = self.core._create_buffer(weights_flat.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        
+        # Check if shader is available
+        if 'fnn-xavier-init' not in self.core.shaders:
+            raise RuntimeError("fnn-xavier-init shader not compiled. Run: glslc shaders/fnn-xavier-init.glsl -o shaders/spv/fnn-xavier-init.spv")
+        
+        # Get or create pipeline
+        pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
+            'fnn-xavier-init', 1, push_constant_size=16
+        )
+        
+        # Get cached descriptor set
+        descriptor_set = self.pipelines.get_cached_descriptor_set(
+            'fnn-xavier-init',
+            [(buf_weights, weights_flat.nbytes)]
+        )
+        
+        # Pack push constants: input_dim, output_dim, scale, seed
+        push_constants = struct.pack('IIfI', input_dim, output_dim, scale, seed)
+        
+        # Dispatch: 2D workgroups (one thread per weight)
+        workgroups_x = (input_dim + 15) // 16
+        workgroups_y = (output_dim + 15) // 16
+        
+        self.core._dispatch_compute(
+            pipeline, pipeline_layout, descriptor_set,
+            workgroups_x, push_constants, workgroups_y, 1
+        )
+        
+        # Download results
+        result = self.core._download_buffer(mem_weights, weights_flat.nbytes, dtype=np.float32)
+        result = result[:input_dim * output_dim]
+        
+        # Cleanup
+        vkDestroyBuffer(self.core.device, buf_weights, None)
+        vkFreeMemory(self.core.device, mem_weights, None)
+        
+        return result.reshape(output_dim, input_dim)
+    
+    def activation_gelu_backward(self, grad_output, input_data):
+        """
+        GPU-accelerated GELU backward pass
+        
+        Args:
+            grad_output: Gradient from next layer (same shape as input_data)
+            input_data: Input to GELU (for computing derivative)
+        
+        Returns:
+            Gradient w.r.t. input
+        """
+        grad_out = grad_output.astype(np.float32).flatten()
+        input_flat = input_data.astype(np.float32).flatten()
+        total_elements = len(input_flat)
+        
+        if len(grad_out) != total_elements:
+            raise ValueError(f"grad_output size {len(grad_out)} != input_data size {total_elements}")
+        
+        # Create buffers
+        buf_grad_out, mem_grad_out = self.core._create_buffer(grad_out.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_input, mem_input = self.core._create_buffer(input_flat.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        buf_grad_in, mem_grad_in = self.core._create_buffer(input_flat.nbytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        
+        # Upload data
+        self.core._upload_buffer(buf_grad_out, mem_grad_out, grad_out)
+        self.core._upload_buffer(buf_input, mem_input, input_flat)
+        
+        # Check if shader is available
+        if 'activation-gelu-backward' not in self.shaders:
+            # CPU fallback
+            sqrt_2_over_pi = 0.7978845608028654
+            coeff = 0.044715
+            grad_in = np.zeros_like(input_flat)
+            for i in range(total_elements):
+                x = input_flat[i]
+                x_cubed = x * x * x
+                z = sqrt_2_over_pi * (x + coeff * x_cubed)
+                tanh_z = np.tanh(z)
+                sech_z = 1.0 / np.cosh(z)
+                sech_sq = sech_z * sech_z
+                dz_dx = sqrt_2_over_pi * (1.0 + 3.0 * coeff * x * x)
+                gelu_grad = 0.5 * (1.0 + tanh_z + x * sech_sq * dz_dx)
+                grad_in[i] = grad_out[i] * gelu_grad
+            return grad_in.reshape(input_data.shape)
+        
+        # Get or create pipeline
+        pipeline, pipeline_layout, desc_layout = self.pipelines.get_or_create_pipeline(
+            'activation-gelu-backward', 3, push_constant_size=4
+        )
+        
+        # Get cached descriptor set
+        descriptor_set = self.pipelines.get_cached_descriptor_set(
+            'activation-gelu-backward',
+            [
+                (buf_grad_out, grad_out.nbytes),
+                (buf_input, input_flat.nbytes),
+                (buf_grad_in, input_flat.nbytes)
+            ]
+        )
+        
+        # Pack push constants
+        push_constants = struct.pack('I', total_elements)
+        
+        # Dispatch
+        workgroups = (total_elements + 255) // 256
+        self.core._dispatch_compute(
+            pipeline, pipeline_layout, descriptor_set,
+            workgroups, push_constants
+        )
+        
+        # Download results
+        result = self.core._download_buffer(mem_grad_in, input_flat.nbytes, dtype=np.float32)
+        result = result[:total_elements].reshape(input_data.shape)
+        
+        # Cleanup
+        vkDestroyBuffer(self.core.device, buf_grad_out, None)
+        vkDestroyBuffer(self.core.device, buf_input, None)
+        vkDestroyBuffer(self.core.device, buf_grad_in, None)
+        vkFreeMemory(self.core.device, mem_grad_out, None)
+        vkFreeMemory(self.core.device, mem_input, None)
+        vkFreeMemory(self.core.device, mem_grad_in, None)
+        
+        return result
 

@@ -12,13 +12,15 @@ Usage:
 import argparse
 import asyncio
 import logging
+import os
 import sys
+import subprocess
 from pathlib import Path
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import MemoryConfig, SNNConfig, LogConfig, ModelConfig, find_gguf_model
+from config import MemoryConfig, SNNConfig, LogConfig, ModelConfig, ModuleConfig, find_gguf_model
 from memory_store import MemoryStore
 from identity import DEFAULT_IDENTITY
 from vulkan_backend import SNNCompute
@@ -26,9 +28,18 @@ from learning.multimodal_encoder import MultimodalEncoder
 from learning.multilingual_utils import MultilingualProcessor
 from learning.knowledge_distillation import KnowledgeDistillation
 
-# Configure logging
+# Configure logging first (before any logger usage)
 logging.basicConfig(level=LogConfig.LEVEL, format=LogConfig.FORMAT)
 logger = logging.getLogger(__name__)
+
+# Module system imports
+try:
+    from modules.registry import ModuleRegistry
+    from modules.tools import ToolExecutor
+    MODULES_AVAILABLE = True
+except ImportError:
+    MODULES_AVAILABLE = False
+    logger.warning("Module system not available, using legacy initialization")
 
 # Try to import model backends
 try:
@@ -44,11 +55,14 @@ except ImportError:
     PYTORCH_AVAILABLE = False
 
 # Try to import continuous learning
+LEARNING_AVAILABLE = False
+LearningConfig = None
+ContinuousLearner = None
 try:
     from learning import ContinuousLearner, LearningConfig
     LEARNING_AVAILABLE = True
-except ImportError:
-    LEARNING_AVAILABLE = False
+except ImportError as e:
+    pass  # Already set to False/None above
 
 # Try to import brain module
 try:
@@ -151,33 +165,160 @@ Examples:
         help="Enter developer mode (password required) - advanced model improvement tools"
     )
     
+    parser.add_argument(
+        "--train-temporal",
+        type=str,
+        help="Train on temporal dataset (path to temporal_dataset.jsonl)"
+    )
+    
+    parser.add_argument(
+        "--train-temporal-limit",
+        type=int,
+        default=None,
+        help="Limit number of items to process from temporal dataset"
+    )
+    
+    parser.add_argument(
+        "--train-conversations",
+        type=str,
+        help="Train on conversational dataset (path to conversations_dataset.jsonl)"
+    )
+    
+    parser.add_argument(
+        "--train-conversations-limit",
+        type=int,
+        default=None,
+        help="Limit number of conversations to process from conversational dataset"
+    )
+    
+    parser.add_argument(
+        "--train-conversations-no-memory",
+        action="store_true",
+        help="Skip storing conversations in memory (only perform STDP learning)"
+    )
+    
+    parser.add_argument(
+        "--train-tools",
+        type=str,
+        metavar="PATH",
+        help="Train on tool usage examples from JSONL file (e.g., data/tool_training.jsonl)"
+    )
+    parser.add_argument(
+        "--train-tools-limit",
+        type=int,
+        metavar="N",
+        help="Limit number of tool examples to process"
+    )
+    parser.add_argument(
+        "--train-tools-no-memory",
+        action="store_true",
+        help="Train on tool examples without storing in memory"
+    )
+    
+    parser.add_argument(
+        "--hilbert",
+        action="store_true",
+        help="Enable Hilbert Multiverse Routing for enhanced semantic similarity (experimental)"
+    )
+    
     args = parser.parse_args()
     
     # Initialize system
     print("Initializing GrillCheese AI...")
     
-    # Load model
-    phi3 = _init_model()
-    if phi3 is None:
-        print(f"{LogConfig.CROSS} No model available")
-        sys.exit(1)
-    
-    # Get embedding dimension from model (auto-detected)
-    embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
-    logger.info(f"Detected embedding dimension: {embedding_dim}")
-    
-    # Initialize memory store
-    print("Initializing memory store...")
-    try:
-        memory = MemoryStore(
-            db_path=args.db,
-            embedding_dim=embedding_dim,
-            identity=DEFAULT_IDENTITY
-        )
-        print(f"{LogConfig.CHECK} Memory store initialized")
-    except Exception as e:
-        print(f"{LogConfig.CROSS} Failed to initialize memory store: {e}")
-        sys.exit(1)
+    # Initialize module system
+    registry = None
+    tool_executor = None
+    if MODULES_AVAILABLE:
+        try:
+            print("Loading modules...")
+            registry = ModuleRegistry()
+            registry.load_all_modules(
+                modules_dir=ModuleConfig.MODULES_DIR,
+                config_path=ModuleConfig.MODULES_CONFIG_FILE
+            )
+            
+            # Get model and memory from registry
+            phi3 = registry.get_active_model_provider()
+            memory_backend = registry.get_active_memory_backend()
+            
+            if memory_backend:
+                memory = memory_backend
+                embedding_dim = memory.embedding_dim
+            else:
+                # Fallback to direct initialization
+                print("No memory backend found in registry, using legacy initialization")
+                phi3 = _init_model()
+                if phi3 is None:
+                    print(f"{LogConfig.CROSS} No model available")
+                    sys.exit(1)
+                embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
+                use_hilbert = args.hilbert or MemoryConfig.USE_HILBERT_ROUTING
+                memory = MemoryStore(
+                    db_path=args.db,
+                    embedding_dim=embedding_dim,
+                    identity=DEFAULT_IDENTITY,
+                    use_hilbert=use_hilbert
+                )
+            
+            if not phi3:
+                # Fallback to direct initialization (GGUF only)
+                print("No model provider found in registry, initializing GGUF model...")
+                phi3 = _init_model()
+                if phi3 is None:
+                    print(f"{LogConfig.CROSS} Failed to initialize GGUF model")
+                    print(f"{LogConfig.WARNING} Please ensure GGUF model is available")
+                    sys.exit(1)
+            
+            # Initialize tool executor
+            tool_executor = ToolExecutor(registry)
+            
+            print(f"{LogConfig.CHECK} Module system initialized")
+        except Exception as e:
+            print(f"{LogConfig.WARNING} Module system initialization failed: {e}")
+            print("Falling back to legacy initialization")
+            registry = None
+            phi3 = _init_model()
+            if phi3 is None:
+                print(f"{LogConfig.CROSS} No model available")
+                sys.exit(1)
+            embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
+            use_hilbert = args.hilbert or MemoryConfig.USE_HILBERT_ROUTING
+            memory = MemoryStore(
+                db_path=args.db,
+                embedding_dim=embedding_dim,
+                identity=DEFAULT_IDENTITY,
+                use_hilbert=use_hilbert
+            )
+    else:
+        # Legacy initialization
+        phi3 = _init_model()
+        if phi3 is None:
+            print(f"{LogConfig.CROSS} No model available")
+            sys.exit(1)
+        
+        # Get embedding dimension from model (auto-detected)
+        embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
+        logger.info(f"Detected embedding dimension: {embedding_dim}")
+        
+        # Initialize memory store
+        print("Initializing memory store...")
+        try:
+            # Enable Hilbert routing if requested
+            use_hilbert = args.hilbert or MemoryConfig.USE_HILBERT_ROUTING
+            if use_hilbert:
+                print("  [Hilbert Multiverse Routing: ENABLED]")
+            
+            memory = MemoryStore(
+                db_path=args.db,
+                embedding_dim=embedding_dim,
+                identity=DEFAULT_IDENTITY,
+                use_hilbert=use_hilbert
+            )
+            print(f"{LogConfig.CHECK} Memory store initialized")
+        except Exception as e:
+            print(f"{LogConfig.CROSS} Failed to initialize memory store: {e}")
+            sys.exit(1)
     
     # Initialize SNN
     print("Initializing GPU backend...")
@@ -189,7 +330,11 @@ Examples:
         sys.exit(1)
     
     # Store system identity if not already stored
-    if memory.get_identity() and memory.identity_index == -1:
+    # Check if identity exists - handle both MemoryStore and plugin backends
+    identity_text = memory.get_identity()
+    identity_index = getattr(memory, 'identity_index', -1)
+    
+    if identity_text and identity_index == -1:
         print("Storing system identity...")
         identity_emb = phi3.get_embedding(DEFAULT_IDENTITY)
         memory.store_identity(identity_emb, DEFAULT_IDENTITY)
@@ -204,7 +349,9 @@ Examples:
                 memory_store=memory,
                 embedding_dim=embedding_dim,
                 state_dir="brain_state",
-                use_gpu=True
+                use_gpu=True,
+                model=phi3,  # Pass model for reranking
+                enable_reranking=False  # Disabled for performance (reranking is computationally expensive)
             )
             print(f"{LogConfig.CHECK} Brain module ready (emotional intelligence enabled)")
         except Exception as e:
@@ -216,6 +363,8 @@ Examples:
         if LEARNING_AVAILABLE:
             print("Initializing continuous learning...")
             try:
+                # Import here to avoid scoping issues
+                from learning import ContinuousLearner, LearningConfig
                 config = LearningConfig(
                     vocab_dir=args.vocab_dir
                 )
@@ -228,6 +377,8 @@ Examples:
                 print(f"{LogConfig.CHECK} Continuous learning enabled")
             except Exception as e:
                 print(f"{LogConfig.WARNING} Failed to initialize learning: {e}")
+                import traceback
+                traceback.print_exc()
         else:
             print(f"{LogConfig.WARNING} Continuous learning module not available")
     
@@ -257,6 +408,189 @@ Examples:
             _show_learning_stats(learner)
         else:
             print("Learning not enabled. Use --learning flag.")
+        return
+    
+    # Handle temporal dataset training
+    if args.train_temporal:
+        if not LEARNING_AVAILABLE:
+            print(f"{LogConfig.CROSS} Continuous learning module not available")
+            return
+        
+        print(f"\n{'='*60}")
+        print("Temporal Dataset Training")
+        print(f"{'='*60}\n")
+        
+        # Initialize learner if not already initialized
+        if learner is None:
+            print("Initializing continuous learner...")
+            if not LEARNING_AVAILABLE:
+                print(f"{LogConfig.WARNING} Continuous learning module not available")
+                return
+            from learning.continuous_learner import ContinuousLearner, LearningConfig
+            learner_config = LearningConfig()
+            learner = ContinuousLearner(
+                memory_store=memory,
+                snn_compute=snn,
+                embedder=phi3,
+                config=learner_config
+            )
+            print(f"{LogConfig.CHECK} Continuous learner initialized")
+        
+        # Load and train on temporal dataset
+        try:
+            print(f"Loading temporal dataset from: {args.train_temporal}")
+            print(f"Limit: {args.train_temporal_limit or 'unlimited'}\n")
+            
+            stats = learner.load_temporal_dataset(
+                dataset_path=args.train_temporal,
+                learn=True,
+                limit=args.train_temporal_limit
+            )
+            
+            print(f"\n{'='*60}")
+            print("Training Complete")
+            print(f"{'='*60}")
+            print(f"Events processed: {stats['events_processed']}")
+            print(f"Associations processed: {stats['associations_processed']}")
+            print(f"STDP updates: {stats['stdp_updates']}")
+            print(f"Errors: {stats['errors']}")
+            print(f"{'='*60}\n")
+            
+            # Save learning state
+            print("Saving learning state...")
+            learner._save_state()
+            print(f"{LogConfig.CHECK} Learning state saved")
+            
+        except FileNotFoundError as e:
+            print(f"{LogConfig.CROSS} Dataset file not found: {e}")
+        except Exception as e:
+            print(f"{LogConfig.CROSS} Training error: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return
+    
+    if args.train_conversations:
+        if not LEARNING_AVAILABLE:
+            print(f"{LogConfig.CROSS} Continuous learning module not available")
+            return
+        
+        print(f"\n{'='*60}")
+        print("Conversational Dataset Training")
+        print(f"{'='*60}\n")
+        
+        # Initialize learner if not already initialized
+        if learner is None:
+            print("Initializing continuous learner...")
+            if not LEARNING_AVAILABLE:
+                print(f"{LogConfig.WARNING} Continuous learning module not available")
+                return
+            from learning.continuous_learner import ContinuousLearner, LearningConfig
+            learner_config = LearningConfig()
+            learner = ContinuousLearner(
+                memory_store=memory,
+                snn_compute=snn,
+                embedder=phi3,
+                config=learner_config
+            )
+            print(f"{LogConfig.CHECK} Continuous learner initialized")
+        
+        # Load and train on conversational dataset
+        try:
+            print(f"Loading conversational dataset from: {args.train_conversations}")
+            print(f"Limit: {args.train_conversations_limit or 'unlimited'}")
+            print(f"Store memories: {not args.train_conversations_no_memory}\n")
+            
+            stats = learner.load_conversational_dataset(
+                dataset_path=args.train_conversations,
+                learn=True,
+                store_memories=not args.train_conversations_no_memory,
+                limit=args.train_conversations_limit
+            )
+            
+            print(f"\n{'='*60}")
+            print("Training Complete")
+            print(f"{'='*60}")
+            print(f"Conversations processed: {stats['conversations_processed']}")
+            print(f"Message pairs processed: {stats['message_pairs_processed']}")
+            print(f"Memories stored: {stats['memories_stored']}")
+            print(f"STDP updates: {stats['stdp_updates']}")
+            print(f"Errors: {stats['errors']}")
+            print(f"{'='*60}\n")
+            
+            # Save learning state
+            print("Saving learning state...")
+            learner._save_state()
+            print(f"{LogConfig.CHECK} Learning state saved")
+            
+        except FileNotFoundError as e:
+            print(f"{LogConfig.CROSS} Dataset file not found: {e}")
+        except Exception as e:
+            print(f"{LogConfig.CROSS} Training error: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return
+    
+    # Tool training mode
+    if args.train_tools:
+        if not LEARNING_AVAILABLE:
+            print(f"{LogConfig.CROSS} Continuous learning module not available")
+            return
+        
+        print(f"\n{'='*60}")
+        print("Tool Usage Training")
+        print(f"{'='*60}\n")
+        
+        # Initialize learner if not already initialized
+        if learner is None:
+            print("Initializing continuous learner...")
+            if not LEARNING_AVAILABLE:
+                print(f"{LogConfig.WARNING} Continuous learning module not available")
+                return
+            from learning.continuous_learner import ContinuousLearner, LearningConfig
+            learner_config = LearningConfig()
+            learner = ContinuousLearner(
+                memory_store=memory,
+                snn_compute=snn,
+                embedder=phi3,
+                config=learner_config
+            )
+            print(f"{LogConfig.CHECK} Continuous learner initialized")
+        
+        # Load tool training dataset
+        try:
+            print(f"Loading tool training dataset from: {args.train_tools}")
+            print(f"Limit: {args.train_tools_limit or 'unlimited'}")
+            print(f"Store memories: {not args.train_tools_no_memory}\n")
+            
+            stats = learner.load_tool_training_dataset(
+                dataset_path=args.train_tools,
+                store_memories=not args.train_tools_no_memory,
+                limit=args.train_tools_limit
+            )
+            
+            print(f"\n{'='*60}")
+            print("Tool Training Results")
+            print(f"{'='*60}")
+            print(f"Examples processed: {stats['examples_processed']}")
+            print(f"Memories stored: {stats['memories_stored']}")
+            print(f"STDP updates: {stats['stdp_updates']}")
+            print(f"Errors: {stats['errors']}")
+            print(f"{'='*60}\n")
+            
+            # Save learning state
+            print("Saving learning state...")
+            learner._save_state()
+            print(f"{LogConfig.CHECK} Learning state saved")
+            print(f"{LogConfig.CHECK} Tool training completed")
+        except FileNotFoundError as e:
+            print(f"{LogConfig.CROSS} Dataset file not found: {e}")
+        except Exception as e:
+            print(f"{LogConfig.CROSS} Tool training error: {e}")
+            import traceback
+            traceback.print_exc()
+        
         return
     
     # Handle calibration
@@ -289,11 +623,11 @@ Examples:
     # Interactive mode or single prompt
     elif args.interactive or (not prompt and not args.stats):
         if learner:
-            asyncio.run(_interactive_mode_async(phi3, memory, snn, learner, brain))
+            asyncio.run(_interactive_mode_async(phi3, memory, snn, learner, brain, registry, tool_executor))
         else:
-            _interactive_mode(phi3, memory, snn, brain)
+            _interactive_mode(phi3, memory, snn, brain, registry, tool_executor)
     elif prompt:
-        _process_prompt(phi3, memory, snn, prompt, learner, brain)
+        _process_prompt(phi3, memory, snn, prompt, learner, brain, registry, tool_executor)
     else:
         print("Error: No prompt provided. Use --interactive for interactive mode.")
         parser.print_help()
@@ -301,10 +635,10 @@ Examples:
 
 
 def _init_model():
-    """Initialize the language model"""
+    """Initialize the language model - GGUF ONLY (no PyTorch fallback)"""
     print("Loading Phi-3 model...")
     
-    # Try GGUF first
+    # Only use GGUF - no PyTorch fallback
     if GGUF_AVAILABLE:
         model_path = find_gguf_model()
         if model_path:
@@ -315,18 +649,78 @@ def _init_model():
                 return phi3
             except Exception as e:
                 print(f"{LogConfig.WARNING} Failed to load GGUF model: {e}")
-    
-    # Fallback to PyTorch
-    if PYTORCH_AVAILABLE:
-        try:
-            phi3 = Phi3Model()
-            print(f"{LogConfig.CHECK} PyTorch model loaded")
-            return phi3
-        except Exception as e:
-            print(f"{LogConfig.CROSS} Failed to load model: {e}")
-    
-    return None
+                print(f"{LogConfig.CROSS} GGUF model is required - PyTorch fallback disabled")
+                return None
+        else:
+            print(f"{LogConfig.CROSS} GGUF model not found")
+            print(f"{LogConfig.WARNING} Please download Phi-3-mini GGUF model")
+            return None
+    else:
+        print(f"{LogConfig.CROSS} GGUF support not available")
+        print(f"{LogConfig.WARNING} Install llama-cpp-python: pip install llama-cpp-python")
+        return None
 
+
+def _show_tiling_info(snn):
+    """Display GPU tiling support information"""
+    try:
+        # Check both 'backend' (SNNCompute) and 'gpu' (other backends) attributes
+        vulkan_backend = None
+        if hasattr(snn, 'backend') and snn.backend is not None:
+            vulkan_backend = snn.backend
+        elif hasattr(snn, 'gpu') and snn.gpu is not None:
+            vulkan_backend = snn.gpu
+        elif hasattr(snn, 'vulkan') and snn.vulkan is not None:
+            vulkan_backend = snn.vulkan
+        
+        if vulkan_backend is not None:
+            if hasattr(vulkan_backend, 'get_tiling_info'):
+                tiling_info = vulkan_backend.get_tiling_info()
+                print("\n=== GPU Tiling Support ===")
+                if tiling_info.get('available', False):
+                    print(f"Device: {tiling_info.get('device_name', 'Unknown')}")
+                    print(f"Vendor: {tiling_info.get('vendor', 'Unknown')} (ID: 0x{tiling_info.get('vendor_id', 0):X})")
+                    print(f"\nTiling Features:")
+                    print(f"  Sparse Binding: {'✓' if tiling_info.get('sparse_binding') else '✗'}")
+                    print(f"  Sparse Residency: {'✓' if tiling_info.get('sparse_residency') else '✗'}")
+                    print(f"  Sparse Residency Aliased: {'✓' if tiling_info.get('sparse_residency_aliased') else '✗'}")
+                    print(f"  Optimal Tiling: {'✓' if tiling_info.get('optimal_tiling') else '✗'}")
+                    print(f"  Shader Image Gather Extended: {'✓' if tiling_info.get('shader_image_gather_extended') else '✗'}")
+                    
+                    if tiling_info.get('amd_optimized'):
+                        print(f"\n  AMD GPU detected - Optimized tiling support available")
+                    elif tiling_info.get('nvidia_optimized'):
+                        print(f"\n  NVIDIA GPU detected - Optimized tiling support available")
+                    elif tiling_info.get('intel_optimized'):
+                        print(f"\n  Intel GPU detected - Basic tiling support")
+                else:
+                    print("Tiling information not available")
+                    if 'error' in tiling_info:
+                        print(f"Error: {tiling_info['error']}")
+            else:
+                print("GPU backend does not support tiling info query")
+        else:
+            # Try to initialize Vulkan directly
+            try:
+                from vulkan_backend import VulkanCompute
+                vulkan = VulkanCompute()
+                tiling_info = vulkan.get_tiling_info()
+                print("\n=== GPU Tiling Support ===")
+                if tiling_info.get('available', False):
+                    print(f"Device: {tiling_info.get('device_name', 'Unknown')}")
+                    print(f"Vendor: {tiling_info.get('vendor', 'Unknown')} (ID: 0x{tiling_info.get('vendor_id', 0):X})")
+                    print(f"\nTiling Features:")
+                    print(f"  Sparse Binding: {'✓' if tiling_info.get('sparse_binding') else '✗'}")
+                    print(f"  Sparse Residency: {'✓' if tiling_info.get('sparse_residency') else '✗'}")
+                    print(f"  Optimal Tiling: {'✓' if tiling_info.get('optimal_tiling') else '✗'}")
+                else:
+                    print("Tiling information not available")
+            except Exception as e:
+                print(f"GPU backend not available: {e}")
+    except Exception as e:
+        print(f"Error checking tiling info: {e}")
+        import traceback
+        traceback.print_exc()
 
 def _show_stats(memory: MemoryStore, learner=None):
     """Display memory statistics"""
@@ -408,14 +802,30 @@ def _show_learning_stats(learner):
     print(f"Total weight: {stdp_stats.get('total_weight', 0):.4f}")
 
 
-def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, learner=None, brain=None):
+def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, learner=None, brain=None, registry=None, tool_executor=None):
     """Process a single prompt and print response"""
     print(f"\nYou: {prompt}\n")
     
     try:
+        # Request context for hooks
+        context_dict = {
+            "user_id": "cli_user",
+            "session_id": "cli_session"
+        }
+        
+        # Pre-process hooks
+        enhanced_prompt = prompt
+        if registry and registry.processing_hooks:
+            for hook in registry.processing_hooks:
+                try:
+                    import asyncio
+                    enhanced_prompt = asyncio.run(hook.pre_process(enhanced_prompt, context_dict))
+                except Exception as e:
+                    logger.warning(f"Hook {hook.name} pre_process failed: {e}")
+        
         # Extract embedding
         print("Extracting embedding...", end="\r")
-        embedding = phi3.get_embedding(prompt)
+        embedding = phi3.get_embedding(enhanced_prompt)
         print(f"{LogConfig.CHECK} Embedding extracted    ")
         
         # Process through brain module (emotional intelligence)
@@ -423,36 +833,58 @@ def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, lea
         emotional_context = ""
         if brain is not None:
             print("Processing emotions...", end="\r")
-            brain_result = brain.process(prompt, embedding)
+            brain_result = brain.process(enhanced_prompt, embedding)
             emotional_context = brain.get_empathy_prompt()
             print(f"{LogConfig.CHECK} Emotion: {brain_result['emotional_state'].dominant_emotion} (valence: {brain_result['emotional_state'].valence:.2f})")
         
         # Store in memory
         print("Storing in memory...", end="\r")
-        memory.store(embedding, prompt)
+        memory.store(embedding, enhanced_prompt)
         print(f"{LogConfig.CHECK} Stored in memory      ")
         
         # Retrieve context
         print("Retrieving context...", end="\r")
-        context = memory.retrieve(embedding, k=MemoryConfig.DEFAULT_K)
+        retrieved = memory.retrieve(embedding, k=MemoryConfig.DEFAULT_K)
+        # Handle both MemoryStore API (returns List[str]) and plugin API (returns List[Tuple[str, float]])
+        if retrieved and isinstance(retrieved[0], tuple):
+            context = [text for text, score in retrieved]
+        else:
+            context = retrieved
         print(f"{LogConfig.CHECK} Retrieved {len(context)} context items")
         
         # Build enhanced prompt with emotional context and self-awareness
         if brain is not None:
             self_awareness = brain.get_self_awareness_prompt()
             if emotional_context:
-                enhanced_prompt = f"{self_awareness}\n\n{emotional_context}\n\nUser: {prompt}"
+                final_prompt = f"{self_awareness}\n\n{emotional_context}\n\nUser: {enhanced_prompt}"
             else:
-                enhanced_prompt = f"{self_awareness}\n\nUser: {prompt}"
+                final_prompt = f"{self_awareness}\n\nUser: {enhanced_prompt}"
         elif emotional_context:
-            enhanced_prompt = f"{emotional_context}\n\nUser: {prompt}"
+            final_prompt = f"{emotional_context}\n\nUser: {enhanced_prompt}"
         else:
-            enhanced_prompt = prompt
+            final_prompt = enhanced_prompt
         
-        # Generate response
-        device_msg = "GPU" if phi3.device != "cpu" else "CPU"
+        # Generate response (with tools if available)
+        device_msg = "GPU" if hasattr(phi3, 'device') and phi3.device != "cpu" else "CPU"
         print(f"Generating response on {device_msg}...")
-        response = phi3.generate(enhanced_prompt, context)
+        
+        # Debug: Check tool availability
+        print(f"🔍 Debug: registry={bool(registry)}, tool_executor={bool(tool_executor)}, registry.tools={bool(registry.tools if registry else False)}")
+        
+        if registry and tool_executor and registry.tools:
+            tools = registry.get_tools()
+            tool_names = [t.name for t in tools]
+            print(f"🔧 Available tools: {', '.join(tool_names)}")
+            response = phi3.generate_with_tools(
+                final_prompt,
+                context,
+                tools=tools,
+                tool_executor=tool_executor
+            )
+            # Note: Tool calls are logged in model_gguf.py with 🔧 ⚙️ ✅ emojis
+        else:
+            print(f"⚠️ Tools not available, using regular generate()")
+            response = phi3.generate(final_prompt, context)
         print(f"{LogConfig.CHECK} Response generated")
         
         # Provide feedback to brain
@@ -505,14 +937,18 @@ def _process_prompt(phi3, memory: MemoryStore, snn: SNNCompute, prompt: str, lea
         sys.exit(1)
 
 
-def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
+def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None, registry=None, tool_executor=None):
     """Interactive conversation mode with emotional intelligence"""
     print("\n" + "=" * 60)
     print("GrillCheese AI - Interactive Mode")
     if brain is not None:
         print("Emotional intelligence: ENABLED")
-    print("Type your messages. Commands: 'quit', 'stats', 'clear', 'emotion'")
+    print("Type your messages. Commands: 'quit', 'stats', 'clear', 'emotion', 'tiling'")
     print("=" * 60 + "\n")
+    
+    # Track recent conversation history
+    conversation_history = []
+    max_history = 6  # Keep last 3 exchanges (user + assistant pairs)
     
     while True:
         try:
@@ -543,6 +979,11 @@ def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
                 print()
                 continue
             
+            if prompt.lower() == 'tiling' or prompt.lower() == 'gpu-info':
+                _show_tiling_info(snn)
+                print()
+                continue
+            
             if prompt.lower() == 'emotion':
                 if brain is not None:
                     state = brain.amygdala.get_state()
@@ -563,34 +1004,131 @@ def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
                     print(f"{LogConfig.CHECK} Memories cleared\n")
                 continue
             
-            # Process through brain module
+            # Store user prompt in memory FIRST (so it's available for retrieval)
             embedding = phi3.get_embedding(prompt)
+            memory.store(embedding, prompt)
             
+            # Process through brain module
             brain_result = None
             emotional_context = ""
+            context = []
+            
             if brain is not None:
                 brain_result = brain.process(prompt, embedding)
                 emotional_context = brain.get_empathy_prompt()
+                # Use brain's memory context (includes identity properly)
+                context = brain_result.get('memory_context', [])
+                # Extract text if tuples
+                if context and isinstance(context[0], tuple):
+                    context = [item[0] if isinstance(item, tuple) else item for item in context]
             
-            memory.store(embedding, prompt)
-            context = memory.retrieve(embedding, k=MemoryConfig.DEFAULT_K)
-            
-            # Build enhanced prompt with self-awareness
-            if brain is not None:
-                self_awareness = brain.get_self_awareness_prompt()
-                if emotional_context:
-                    enhanced_prompt = f"{self_awareness}\n\n{emotional_context}\n\nUser: {prompt}"
+            # Fallback to direct memory retrieval if brain not available
+            if not context:
+                # Retrieve fewer memories and filter by relevance
+                retrieved = memory.retrieve(embedding, k=3, include_identity=True)
+                # Extract text if tuples and filter out low-relevance items
+                if retrieved and isinstance(retrieved[0], tuple):
+                    # Filter by similarity score (keep only relevant memories)
+                    filtered = []
+                    for item in retrieved:
+                        if isinstance(item, tuple):
+                            text, score = item
+                            # Only include if similarity is reasonable (>0.3) or it's identity
+                            if score > 0.3 or "GrillCheese" in text or len(text) > 200:
+                                filtered.append(text)
+                        else:
+                            filtered.append(item)
+                    context = filtered
                 else:
-                    enhanced_prompt = f"{self_awareness}\n\nUser: {prompt}"
-            elif emotional_context:
-                enhanced_prompt = f"{emotional_context}\n\nUser: {prompt}"
-            else:
-                enhanced_prompt = prompt
+                    context = retrieved
             
-            device_msg = "GPU" if phi3.device != "cpu" else "CPU"
+            # Enhance context with brain state if available
+            # Identity should be first (from memory.retrieve with include_identity=True)
+            # Merge self-awareness and emotional context into identity if present
+            if brain is not None and context:
+                self_awareness = brain.get_self_awareness_prompt()
+                
+                # Check if first item is identity (contains "GrillCheese" or is long)
+                identity_idx = 0
+                if context and ("GrillCheese" in context[0] or len(context[0]) > 200):
+                    # Merge self-awareness and emotional context into identity
+                    identity_parts = [context[0]]  # Start with identity
+                    if self_awareness:
+                        identity_parts.append(self_awareness)
+                    if emotional_context:
+                        identity_parts.append(emotional_context)
+                    # Combine into single identity string
+                    enhanced_identity = "\n\n".join(identity_parts)
+                    # Replace first item with enhanced identity
+                    context = [enhanced_identity] + context[1:]
+                else:
+                    # No identity found, prepend it
+                    identity_text = memory.get_identity() or ""
+                    identity_parts = [identity_text] if identity_text else []
+                    if self_awareness:
+                        identity_parts.append(self_awareness)
+                    if emotional_context:
+                        identity_parts.append(emotional_context)
+                    if identity_parts:
+                        enhanced_identity = "\n\n".join(identity_parts)
+                        context = [enhanced_identity] + context
+            
+            # Add recent conversation history to context
+            # PRIORITIZE conversation history over semantic memories for continuity
+            if conversation_history:
+                # Format recent history
+                history_context = []
+                for hist_item in conversation_history[-max_history:]:
+                    if isinstance(hist_item, dict):
+                        if hist_item.get('role') == 'user':
+                            history_context.append(f"Previous user: {hist_item.get('content', '')}")
+                        elif hist_item.get('role') == 'assistant':
+                            history_context.append(f"Previous assistant: {hist_item.get('content', '')}")
+                
+                if history_context:
+                    history_text = "\n".join(history_context)
+                    # Insert after identity, BEFORE semantic memories (prioritize conversation flow)
+                    if context and ("GrillCheese" in context[0] or len(context[0]) > 200):
+                        # Identity is first, add history after it, then semantic memories
+                        context = [context[0], history_text] + context[1:]
+                    else:
+                        # No identity, prepend history
+                        context = [history_text] + context
+            
+            device_msg = "GPU" if hasattr(phi3, 'device') and phi3.device != "cpu" else "CPU"
             print(f"Generating on {device_msg}...")
             
-            response = phi3.generate(enhanced_prompt, context)
+            # Use generate_with_tools if available, otherwise fall back to generate()
+            if registry and tool_executor and registry.tools:
+                tools = registry.get_tools()
+                tool_names = [t.name for t in tools]
+                print(f"🔧 Available tools: {', '.join(tool_names)}")
+                
+                # Debug: Check if method exists
+                print(f"🔍 Checking phi3 type: {type(phi3)}")
+                print(f"🔍 Has generate_with_tools: {hasattr(phi3, 'generate_with_tools')}")
+                
+                if hasattr(phi3, 'generate_with_tools'):
+                    print(f"🔍 Calling generate_with_tools...")
+                    response = phi3.generate_with_tools(
+                        prompt,
+                        context,
+                        tools=tools,
+                        tool_executor=tool_executor
+                    )
+                else:
+                    print(f"⚠️ phi3 doesn't have generate_with_tools, using generate()")
+                    response = phi3.generate(prompt, context)
+            else:
+                # Let model.generate() handle proper Phi-3 chat formatting with identity
+                response = phi3.generate(prompt, context)
+            
+            # Store conversation in history
+            conversation_history.append({'role': 'user', 'content': prompt})
+            conversation_history.append({'role': 'assistant', 'content': response})
+            # Keep only recent history
+            if len(conversation_history) > max_history:
+                conversation_history = conversation_history[-max_history:]
             spike_metrics = snn.process(embedding)
             
             # Provide feedback to brain
@@ -631,7 +1169,7 @@ def _interactive_mode(phi3, memory: MemoryStore, snn: SNNCompute, brain=None):
             traceback.print_exc()
 
 
-async def _interactive_mode_async(phi3, memory: MemoryStore, snn: SNNCompute, learner, brain=None):
+async def _interactive_mode_async(phi3, memory: MemoryStore, snn: SNNCompute, learner, brain=None, registry=None, tool_executor=None):
     """Interactive conversation mode with continuous learning and emotional intelligence"""
     print("\n" + "=" * 60)
     print("GrillCheese AI - Interactive Mode")
@@ -722,7 +1260,7 @@ async def _interactive_mode_async(phi3, memory: MemoryStore, snn: SNNCompute, le
                 else:
                     enhanced_prompt = prompt
                 
-                device_msg = "GPU" if phi3.device != "cpu" else "CPU"
+                device_msg = "GPU" if hasattr(phi3, 'device') and phi3.device != "cpu" else "CPU"
                 print(f"Generating on {device_msg}...")
                 
                 response = phi3.generate(enhanced_prompt, context)
@@ -878,7 +1416,16 @@ def _dev_export_training(memory: MemoryStore, output_file: str):
     
     print(f"Exporting training data to {output_file}...")
     
-    conn = sqlite3.connect(memory.db_path)
+    # Handle both MemoryStore and plugin backends
+    db_path = getattr(memory, 'db_path', None)
+    if db_path is None and hasattr(memory, '_backend'):
+        db_path = getattr(memory._backend, 'db_path', None)
+    
+    if db_path is None:
+        print(f"{LogConfig.CROSS} Cannot access database: no database path available")
+        return
+    
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     # Get all non-identity memories with metadata
@@ -914,11 +1461,20 @@ def _dev_export_training(memory: MemoryStore, output_file: str):
     print(f"{LogConfig.CHECK} Exported {len(pairs)} entries to {output_file}")
 
 
-def _dev_analyze_memory(memory: MemoryStore):
+def _dev_analyze_memory(memory):
     """Deep memory analysis"""
     import sqlite3
     
-    conn = sqlite3.connect(memory.db_path)
+    # Handle both MemoryStore and plugin backends
+    db_path = getattr(memory, 'db_path', None)
+    if db_path is None and hasattr(memory, '_backend'):
+        db_path = getattr(memory._backend, 'db_path', None)
+    
+    if db_path is None:
+        print(f"{LogConfig.CROSS} Cannot analyze memory: no database path available")
+        return
+    
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     print("\n=== Deep Memory Analysis ===\n")
@@ -1089,15 +1645,30 @@ def _dev_export_embeddings(memory: MemoryStore, output_file: str):
     
     print(f"Exporting embeddings to {output_file}...")
     
-    # Export memory keys and values
-    np.savez_compressed(
-        output_file,
-        keys=memory.memory_keys[:memory.num_memories],
-        values=memory.memory_values[:memory.num_memories],
-        texts=np.array(memory.memory_texts[:memory.num_memories], dtype=object)
-    )
+    # Get memory data - handle both wrapper and direct MemoryStore
+    memory_keys = getattr(memory, 'memory_keys', None)
+    memory_values = getattr(memory, 'memory_values', None)
+    memory_texts = getattr(memory, 'memory_texts', [])
+    num_memories = getattr(memory, 'num_memories', 0)
     
-    print(f"{LogConfig.CHECK} Exported {memory.num_memories} embeddings")
+    # If wrapper, try to get from underlying backend
+    if memory_keys is None and hasattr(memory, '_backend'):
+        memory_keys = getattr(memory._backend, 'memory_keys', None)
+        memory_values = getattr(memory._backend, 'memory_values', None)
+        memory_texts = getattr(memory._backend, 'memory_texts', [])
+        num_memories = getattr(memory._backend, 'num_memories', 0)
+    
+    if memory_keys is not None and memory_values is not None:
+        # Export memory keys and values
+        np.savez_compressed(
+            output_file,
+            keys=memory_keys[:num_memories],
+            values=memory_values[:num_memories],
+            texts=np.array(memory_texts[:num_memories], dtype=object)
+        )
+        print(f"{LogConfig.CHECK} Exported {num_memories} embeddings")
+    else:
+        print(f"{LogConfig.WARNING} Cannot export: memory backend doesn't support direct embedding export")
 
 
 def _dev_brain_dump(brain):
@@ -1123,14 +1694,29 @@ def _dev_brain_dump(brain):
     
     print("\nBasal Ganglia:")
     bg = stats['basal_ganglia']
-    print(f"  Current strategy: {bg['current_strategy']}")
-    print(f"  Hebbian weights shape: {bg['hebbian_weights_shape']}")
+    print(f"  Current strategy: {bg.get('current_strategy', 'unknown')}")
+    print(f"  Current confidence: {bg.get('current_confidence', 0.0):.3f}")
+    print(f"  Go rate: {bg.get('go_rate', 0.0):.3f}")
+    if 'region_weights' in bg:
+        print(f"  Region weights: {bg['region_weights']}")
+    if 'hebbian_weights_shape' in bg:
+        print(f"  Hebbian weights shape: {bg['hebbian_weights_shape']}")
     
     print("\nExperience:")
-    exp = stats['experience']
-    print(f"  Total interactions: {exp['total_experiences']}")
-    print(f"  Average quality: {exp['avg_quality']:.3f}")
-    print(f"  Best strategy: {exp['best_strategy']}")
+    exp = stats.get('experiential_learning', {})
+    if exp and exp.get('total_experiences', 0) > 0:
+        print(f"  Total interactions: {exp.get('total_experiences', 0)}")
+        avg_quality = exp.get('avg_quality', 0.0)
+        if avg_quality > 0:
+            print(f"  Average quality: {avg_quality:.3f}")
+        best_strategy = exp.get('best_strategy', 'unknown')
+        if best_strategy != 'unknown':
+            print(f"  Best strategy: {best_strategy}")
+        insights = exp.get('insights', [])
+        if insights:
+            print(f"  Insights: {len(insights)} available")
+    else:
+        print("  No experience data available")
     print()
 
 
@@ -1166,8 +1752,13 @@ def _dev_comprehensive_stats(memory: MemoryStore, snn: SNNCompute, brain):
         print(f"Current strategy: {stats['basal_ganglia']['current_strategy']}")
         print(f"Stress level: {stats['cns']['current_state']['stress_level']:.2f}")
     
-    # GPU stats
-    if memory.gpu:
+    # GPU stats - handle both wrapper and direct MemoryStore
+    gpu = getattr(memory, 'gpu', None)
+    if gpu is None and hasattr(memory, '_backend'):
+        # Try to get from underlying backend
+        gpu = getattr(memory._backend, 'gpu', None)
+    
+    if gpu:
         print("\n=== GPU Statistics ===")
         print("Vulkan compute: ENABLED")
         print(f"Embedding dimension: {memory.embedding_dim}")
@@ -1253,7 +1844,16 @@ def _teach_mode(phi3, memory: MemoryStore, snn: SNNCompute):
             elif cmd == 'list':
                 # Query database for protected memories
                 import sqlite3
-                conn = sqlite3.connect(memory.db_path)
+                # Handle both MemoryStore and plugin backends
+                db_path = getattr(memory, 'db_path', None)
+                if db_path is None and hasattr(memory, '_backend'):
+                    db_path = getattr(memory._backend, 'db_path', None)
+                
+                if db_path is None:
+                    print(f"{LogConfig.CROSS} Cannot access database: no database path available")
+                    continue
+                
+                conn = sqlite3.connect(db_path)
                 cursor = conn.cursor()
                 cursor.execute("SELECT text, timestamp FROM memories WHERE is_protected = 1 ORDER BY timestamp DESC")
                 rows = cursor.fetchall()
@@ -1272,7 +1872,16 @@ def _teach_mode(phi3, memory: MemoryStore, snn: SNNCompute):
                 
                 # Show protected count
                 import sqlite3
-                conn = sqlite3.connect(memory.db_path)
+                # Handle both MemoryStore and plugin backends
+                db_path = getattr(memory, 'db_path', None)
+                if db_path is None and hasattr(memory, '_backend'):
+                    db_path = getattr(memory._backend, 'db_path', None)
+                
+                if db_path is None:
+                    print(f"{LogConfig.CROSS} Cannot access database: no database path available")
+                    continue
+                
+                conn = sqlite3.connect(db_path)
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM memories WHERE is_protected = 1")
                 protected_count = cursor.fetchone()[0]

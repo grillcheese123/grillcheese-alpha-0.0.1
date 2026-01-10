@@ -1,0 +1,24 @@
+{
+  "scan_directories": ["official", "core", "community", "marketplace"],
+  "enabled_modules": {
+    "memory_backends": ["SqliteFaissBackend", "CapsuleMemoryBackend"],
+    "model_providers": ["GGUFModelProvider"],
+    "processing_hooks": [],
+    "api_extensions": [],
+    "tools": []
+  },
+  "defaults": {
+    "memory_backend": "SqliteFaissBackend",
+    "model_provider": "GGUFModelProvider"
+  },
+  "module_settings": {
+    "PromptEnhancerHook": {
+      "enabled": true,
+      "priority": 10
+    },
+    "GGUFModelProvider": {
+      "n_gpu_layers": -1,
+      "model_path": null
+    }
+  }
+}

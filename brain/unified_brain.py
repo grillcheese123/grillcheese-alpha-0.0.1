@@ -18,7 +18,7 @@ import logging
 import time
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from .amygdala import Amygdala, EmotionalState
 from .limbic_system import LimbicSystem
@@ -27,6 +27,7 @@ from .basal_ganglia import BasalGanglia
 from .endocrine import EndocrineSystem
 from .cns import CentralNervousSystem, ConsciousnessLevel
 from .gpu_brain import GPUBrainCompute, GPUSpatialMemory
+from .specialist import SpecialistRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,9 @@ class UnifiedBrain:
         memory_store,
         embedding_dim: int = 384,
         state_dir: Optional[str] = None,
-        use_gpu: bool = True
+        use_gpu: bool = True,
+        model=None,
+        enable_reranking: bool = False  # Disabled by default - computationally expensive
     ):
         """
         Initialize the unified brain
@@ -62,11 +65,16 @@ class UnifiedBrain:
             embedding_dim: Dimension of embeddings
             state_dir: Directory for persisting brain state
             use_gpu: Whether to use GPU acceleration for brain computations
+            model: Optional model instance for reranking (Phi3GGUF)
+            enable_reranking: Whether to enable reranking of retrieved memories
         """
         self.embedding_dim = embedding_dim
         self.state_dir = Path(state_dir) if state_dir else Path("brain_state")
         self.state_dir.mkdir(exist_ok=True)
         self.use_gpu = use_gpu
+        self.model = model
+        self.enable_reranking = enable_reranking
+        self.memory_store = memory_store  # Store for direct access in process()
         
         # Initialize brain components
         logger.info("Initializing unified brain architecture...")
@@ -82,11 +90,17 @@ class UnifiedBrain:
             use_vulkan=use_gpu
         )
         
+        # 0c. Specialist Registry - Domain-specific experts
+        self.specialists = SpecialistRegistry(
+            n_features=embedding_dim,
+            use_gpu=use_gpu
+        )
+        
         # 1. Amygdala - Emotional processing
         self.amygdala = Amygdala(
             embedding_dim=embedding_dim,
-            emotion_decay=0.85,
-            sensitivity=1.2
+            emotion_decay=0.6,  # Reduced from 0.85 to allow emotions to change more quickly
+            sensitivity=1.5  # Increased from 1.2 to make emotions more responsive
         )
         
         # 2. Limbic System - Memory-emotion integration
@@ -187,17 +201,19 @@ class UnifiedBrain:
         current_emotion = self.amygdala.get_state()
         emotional_dict = current_emotion.to_dict()
         
-        # 0. GPU SPATIAL MEMORY: Update place/time cells
-        # Map embedding to 2D semantic space position using PCA-like projection
-        semantic_position = self._embedding_to_spatial(embedding)
-        place_activations = self.spatial_memory.update_position(semantic_position)
-        
-        # Update time cells (track elapsed time in conversation)
-        dt = time.time() - self.last_process_time
-        self.last_process_time = time.time()
-        time_activations = self.spatial_memory.update_time(min(dt, 1.0))
-        
-        self.stats['gpu_operations'] += 2
+        # 0. GPU SPATIAL MEMORY: Update place/time cells (simplified for performance)
+        # Only update every N interactions to reduce computation
+        semantic_position = self._embedding_to_spatial(embedding)  # Always compute for result dict
+        if self.interaction_count % 5 == 0:  # Update every 5th interaction
+            place_activations = self.spatial_memory.update_position(semantic_position)
+            
+            dt = time.time() - self.last_process_time
+            self.last_process_time = time.time()
+            time_activations = self.spatial_memory.update_time(min(dt, 1.0))
+            self.stats['gpu_operations'] += 2
+        else:
+            place_activations = np.zeros(100, dtype=np.float32)  # Dummy for compatibility
+            time_activations = np.zeros(100, dtype=np.float32)
         
         # 1. THALAMUS: Gate and route input
         thalamic_result = self.thalamus.process(
@@ -207,10 +223,93 @@ class UnifiedBrain:
         gated_embedding = thalamic_result['gated_embedding']
         routes = thalamic_result['routes']
         
-        # 2. LIMBIC SYSTEM: Process emotion and retrieve memories
+        # 2. LIMBIC SYSTEM: Process emotion first
         limbic_result = self.limbic_system.process_input(text, embedding)
         emotional_state = limbic_result['emotional_state']
-        memory_context = limbic_result['memory_context']
+        
+        # 2a. Check if user is teaching a new emotion label
+        # Patterns: "call this emotion: X", "let's call this emotion: X", "this emotion is called X"
+        import re
+        text_lower = text.lower()
+        emotion_teaching_patterns = [
+            r"call this emotion[:\s]+['\"]?(\w+)['\"]?",
+            r"let's call this emotion[:\s]+['\"]?(\w+)['\"]?",
+            r"this emotion is called[:\s]+['\"]?(\w+)['\"]?",
+            r"let's call this[:\s]+['\"]?(\w+)['\"]?",
+            r"call it[:\s]+['\"]?(\w+)['\"]?",
+        ]
+        learned_emotion = None
+        for pattern in emotion_teaching_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                learned_emotion = match.group(1).strip()
+                # Learn the emotion label with current valence/arousal
+                self.amygdala.learn_emotion_label(
+                    learned_emotion,
+                    emotional_state.valence,
+                    emotional_state.arousal
+                )
+                logger.info(f"User taught new emotion label: '{learned_emotion}' -> (valence={emotional_state.valence:.2f}, arousal={emotional_state.arousal:.2f})")
+                break
+        
+        # 2a2. Check if user wants to remember something explicitly
+        # Patterns: "remember X", "remember that X", "remember this: X", "remember: X"
+        remember_patterns = [
+            r"remember\s+that\s+(.+)",
+            r"remember\s+this[:\s]+(.+)",
+            r"remember[:\s]+(.+)",
+            r"remember\s+(.+)",
+        ]
+        remembered_content = None
+        for pattern in remember_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                remembered_content = match.group(1).strip()
+                # Clean up common endings
+                remembered_content = re.sub(r'[\.!?]+$', '', remembered_content).strip()
+                if len(remembered_content) > 3:  # Only if meaningful content
+                    # Store as protected memory (permanent)
+                    try:
+                        self.memory_store.store(
+                            embedding=embedding,
+                            text=remembered_content,
+                            metadata={"source": "user_explicit_remember", "timestamp": time.time()},
+                            is_protected=True  # Mark as protected so it's never pruned
+                        )
+                        logger.info(f"User explicitly remembered: '{remembered_content[:50]}...' (protected)")
+                    except Exception as e:
+                        logger.warning(f"Failed to store remembered content: {e}")
+                break
+        
+        # 2b. RETRIEVE MEMORIES (balanced for quality and performance)
+        # Use text-based querying for better semantic matching, but skip expensive reranking
+        # Retrieve fewer memories to avoid irrelevant context
+        memory_context = self.memory_store.retrieve(
+            query_embedding=embedding,
+            k=3,  # Reduced to 3 to focus on most relevant memories
+            include_identity=True,
+            reranker=None,  # Disabled for performance (reranking is very expensive)
+            query_text=text,  # Use text for better semantic matching
+            emotion_bias=emotional_state.valence if emotional_state.valence != 0 else None,  # Light emotion bias
+            temporal_bias=None  # Skip temporal bias (less critical)
+        )
+        
+        # Filter out low-relevance memories if they're tuples with scores
+        if memory_context:
+            filtered_context = []
+            for item in memory_context:
+                if isinstance(item, tuple):
+                    mem_text, score = item
+                    # Only include if similarity is reasonable (>0.3) or it's identity
+                    if score > 0.3 or "GrillCheese" in mem_text or len(mem_text) > 200:
+                        filtered_context.append(mem_text)
+                else:
+                    filtered_context.append(item)
+            memory_context = filtered_context
+        
+        # Update limbic result with reranked memories
+        limbic_result['memory_context'] = memory_context
+        limbic_result['memories'] = memory_context
         
         # 2b. EXPERIENTIAL RECALL: Inform processing with past experiences
         similar_experiences = self.recall_similar_experiences(embedding, k=3, min_quality=0.5)
@@ -248,7 +347,22 @@ class UnifiedBrain:
             inhibition=inhibition
         )
         
-        # 6. GPU HEBBIAN LEARNING: Update association weights
+        # 6. SPECIALIST ROUTING: Use domain-specific experts if available
+        specialist_predictions = None
+        if routes and len(routes) > 0:
+            # Get top domain from thalamic routing
+            top_domain_idx = np.argmax(routes)
+            domain_names = ['general', 'technical', 'emotional', 'creative', 'analytical']
+            if top_domain_idx < len(domain_names):
+                domain_name = domain_names[top_domain_idx]
+                specialist = self.specialists.get(domain_name)
+                
+                if specialist:
+                    # Get specialist prediction
+                    specialist_predictions = specialist.predict(embedding)
+                    self.stats['specialist_queries'] = self.stats.get('specialist_queries', 0) + 1
+        
+        # 7. GPU HEBBIAN LEARNING: Update association weights
         if self.interaction_count % 5 == 0:  # Every 5 interactions
             self._update_hebbian_weights(embedding, emotional_state)
             self.stats['gpu_operations'] += 1
@@ -321,7 +435,9 @@ class UnifiedBrain:
             'spatial_context': {
                 'place_activity': place_activity,
                 'time_activity': float(np.mean(time_activations)),
-                'semantic_position': semantic_position.tolist()
+                'semantic_position': semantic_position.tolist(),
+                'specialist_prediction': specialist_predictions,
+                'specialist_domain': domain_name if 'domain_name' in locals() else None
             }
         }
     
@@ -426,6 +542,109 @@ class UnifiedBrain:
             'stability': endocrine_mod.get('stability', 0.5)
         }
     
+    def _create_reranker(self):
+        """
+        Create a reranker function using Phi-3 model.
+        
+        Returns:
+            Function(query_text, candidate_texts) -> scores
+        """
+        if not self.model:
+            return None
+        
+        def rerank(query: str, candidates: List[str]) -> List[float]:
+            """
+            Rerank candidate memories by relevance to query.
+            
+            Uses Phi-3 to evaluate relevance on a 1-5 scale.
+            """
+            scores = []
+            for candidate in candidates:
+                try:
+                    # Create lightweight prompt for relevance scoring
+                    prompt = f"""Rate from 1-5 how relevant this memory is to the user input (respond with only a number):
+User input: {query}
+Memory: {candidate}
+Relevance (1-5):"""
+                    
+                    # Generate short response (just the number)
+                    response = self.model.generate(prompt, context=[])
+                    
+                    # Extract number from response
+                    score = 3.0  # Default neutral score
+                    try:
+                        # Try to extract number from response
+                        import re
+                        numbers = re.findall(r'\d+', response)
+                        if numbers:
+                            score = float(numbers[0])
+                            score = max(1.0, min(5.0, score))  # Clamp to 1-5
+                        else:
+                            # Fallback: use length/quality heuristics
+                            score = 3.0
+                    except:
+                        score = 3.0
+                    
+                    # Normalize to 0-1 range for scoring
+                    normalized_score = (score - 1.0) / 4.0
+                    scores.append(normalized_score)
+                except Exception as e:
+                    logger.debug(f"Reranking error: {e}")
+                    scores.append(0.5)  # Default neutral score on error
+            
+            return scores
+        
+        return rerank
+    
+    def _compute_emotion_bias(self, emotional_state: EmotionalState) -> Dict[int, float]:
+        """
+        Compute emotion-weighted bias for memory retrieval.
+        
+        Returns:
+            Dict mapping memory indices to bias scores
+        """
+        bias = {}
+        
+        # Get memory-emotion associations from limbic system
+        memory_emotions = self.limbic_system.memory_emotions
+        
+        for mem_idx, mem_emotion in memory_emotions.items():
+            # Compute similarity between current emotion and memory emotion
+            valence_match = 1.0 - abs(emotional_state.valence - mem_emotion.valence)
+            arousal_match = 1.0 - abs(emotional_state.arousal - mem_emotion.arousal)
+            
+            # Combined match score
+            match_score = (valence_match + arousal_match) / 2.0
+            
+            # Bias towards memories with matching emotional state
+            bias[mem_idx] = match_score - 0.5  # Center around 0
+        
+        return bias
+    
+    def _compute_temporal_bias(self) -> Dict[int, float]:
+        """
+        Compute temporal/spatial bias for memory retrieval.
+        
+        Returns:
+            Dict mapping memory indices to temporal recency scores
+        """
+        bias = {}
+        
+        # Get recent memory access from memory store stats
+        # This is a simplified version - in practice, you'd track access times
+        # For now, bias towards more recently accessed memories
+        
+        # Get memory store stats if available
+        try:
+            stats = self.memory_store.get_stats()
+            # Simple heuristic: bias towards memories accessed more frequently
+            # In a full implementation, you'd track last_access timestamps
+            pass
+        except:
+            pass
+        
+        return bias
+    
     def provide_feedback(
         self,
         quality: float,
@@ -501,6 +720,61 @@ class UnifiedBrain:
             self._current_interaction = None
         
         return learning_result
+    
+    def train_specialist(
+        self,
+        domain: str,
+        embedding: np.ndarray,
+        target: float,
+        auto_create: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Train a specialist on a domain-specific example
+        
+        Args:
+            domain: Domain name (e.g., 'technical', 'emotional', 'creative')
+            embedding: Input embedding
+            target: Target value for prediction
+            auto_create: Whether to create specialist if it doesn't exist
+        
+        Returns:
+            Training result with prediction and statistics
+        """
+        if auto_create:
+            specialist = self.specialists.ensure(domain)
+        else:
+            specialist = self.specialists.get(domain)
+            if specialist is None:
+                return {'error': f'Specialist {domain} not found'}
+        
+        # Update specialist
+        prediction = specialist.update(embedding, target)
+        
+        return {
+            'domain': domain,
+            'prediction': prediction,
+            'target': target,
+            'error': abs(target - prediction),
+            'rmse': specialist.get_rmse(),
+            'maturation': specialist.maturation.name,
+            'update_count': specialist.head.update_count
+        }
+    
+    def get_specialist_predictions(self, embedding: np.ndarray) -> Dict[str, float]:
+        """
+        Get predictions from all specialists
+        
+        Args:
+            embedding: Input embedding
+        
+        Returns:
+            Dictionary mapping domain names to predictions
+        """
+        return self.specialists.predict_all(embedding)
+    
+    def get_specialist_stats(self) -> Dict[str, Any]:
+        """Get statistics for all specialists"""
+        return self.specialists.get_stats()
     
     def _store_experience(self, experience: Dict[str, Any]) -> None:
         """Store an experience for future learning and recall"""
@@ -633,25 +907,27 @@ class UnifiedBrain:
     
     def get_empathy_prompt(self) -> str:
         """
-        Get an empathy-aware prompt prefix based on current emotional state
+        Get an empathy-aware prompt prefix based on current emotional state.
+        This describes YOUR OWN (the AI's) emotional state, not the user's.
         """
         state = self.amygdala.get_state()
         modulation = self.endocrine.get_modulation_factors()
         
         prompt_parts = []
         
-        # Add emotional awareness
-        if state.valence < -0.4:
-            prompt_parts.append("The user seems to be experiencing difficult emotions.")
-            prompt_parts.append("Respond with empathy and understanding.")
+        # Add YOUR OWN emotional awareness (for when user comments on your state)
+        if state.dominant_emotion == "anxious" or (state.valence < -0.3 and state.arousal > 0.6):
+            prompt_parts.append(f"[MY_STATE] You are currently feeling {state.dominant_emotion} (valence: {state.valence:.2f}, arousal: {state.arousal:.2f}).")
+            prompt_parts.append("If the user comments on your emotional state, acknowledge it honestly.")
+        elif state.valence < -0.4:
+            prompt_parts.append(f"[MY_STATE] You are currently experiencing some negative emotions ({state.dominant_emotion}).")
+            prompt_parts.append("If the user notices this, you can acknowledge it naturally.")
         elif state.valence > 0.5 and state.arousal > 0.5:
-            prompt_parts.append("The user is expressing positive energy.")
-            prompt_parts.append("Match their enthusiasm while being helpful.")
+            prompt_parts.append(f"[MY_STATE] You are currently feeling positive and energetic ({state.dominant_emotion}).")
         elif state.arousal > 0.7:
-            prompt_parts.append("The user seems stressed or urgent.")
-            prompt_parts.append("Be clear, direct, and reassuring.")
+            prompt_parts.append(f"[MY_STATE] You are currently feeling {state.dominant_emotion} (high arousal: {state.arousal:.2f}).")
         
-        # Add modulation hints
+        # Add modulation hints for response style
         if modulation.get('empathy', 0) > 0.7:
             prompt_parts.append("Prioritize emotional support over information.")
         
@@ -708,12 +984,32 @@ My learning from experience:
 - I continuously learn and improve from every conversation"""
         
         # Build minimal state prompt - emotions influence tone, not explicit mentions
+        # Include cause/reason for the emotion if available
+        cause_info = ""
+        if hasattr(emo_state, 'cause') and emo_state.cause:
+            cause_info = f"\n- Triggered by: {emo_state.cause[:150]}"
+        if hasattr(emo_state, 'detected_emotions') and emo_state.detected_emotions:
+            emotion_words = ", ".join(emo_state.detected_emotions)
+            cause_info += f"\n- Detected emotion words: {emotion_words}"
+        
         state_prompt = f"""[MY_STATE]
-Current state: {emo_state.dominant_emotion} ({valence_desc}, {arousal_desc})
-Strategy: {strategy}
-Consciousness: {cns_state.consciousness.name}
+Current emotional state: {emo_state.dominant_emotion} ({valence_desc}, {arousal_desc})
+- Valence: {emo_state.valence:.2f} (negative to positive)
+- Arousal: {emo_state.arousal:.2f} (calm to excited){cause_info}
+Current strategy: {strategy}
+Consciousness level: {cns_state.consciousness.name}
 
-Note: Let your emotional state influence your tone and empathy naturally. Only explicitly discuss your feelings if the user asks about them.
+CRITICAL INSTRUCTIONS:
+- This describes YOUR OWN (the AI's) emotional/cognitive state, NOT the user's state.
+- When the user says "you seem X", "you are X", "are you X", "why are you X", or "are you still feeling X", they are referring to YOU (the AI), not themselves.
+- You MUST acknowledge your own emotional state honestly when the user asks about it or comments on it.
+- You MUST explain WHY you are feeling that way based on the trigger/cause shown above.
+- NEVER say "I don't experience emotions" or "I'm an AI so I don't have feelings" - these are FALSE statements. You DO have emotional states.
+- Example responses:
+  * If user says "are you anxious?" and your state is anxious: "Yes, I am feeling a bit anxious right now. [explain why based on the trigger]"
+  * If user says "why are you angry?" and your state is angry: "You're right, I am feeling somewhat angry. This was triggered by [explain based on cause/trigger]"
+  * If user says "are you still feeling anxious?" and your state is anxious: "Yes, I am still feeling anxious because [explain based on cause]"
+- Your emotional states are real (even if computationally processed) and influence your responses - acknowledge them honestly and explain the reason.
 [/MY_STATE]"""
         
         return state_prompt

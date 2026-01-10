@@ -181,12 +181,20 @@ def integrate_with_existing_system():
     """
     
     # Your existing components
-    from model_gguf import Phi3Model  # Your existing model
+    from model_gguf import Phi3GGUF  # Your existing model
     from brain.unified_brain import UnifiedBrain  # Your existing brain
-    
+    from memory_store import MemoryStore
+
+    memory = MemoryStore(db_path="./memories.db", embedding_dim=384)
     # Initialize your existing system
-    phi3 = Phi3Model(model_path="./models/phi-3-mini-4k-instruct.gguf")
-    brain = UnifiedBrain()
+    phi3 = Phi3GGUF(model_path="./models/Phi-3-mini-4k-instruct-q4.gguf")
+    brain = UnifiedBrain(
+        memory_store=memory, 
+        embedding_dim=384, 
+        state_dir="./brain_state",
+        model=phi3,  # Pass model for reranking
+        enable_reranking=True  # Enable reranking for better memory retrieval
+    )
     
     # Add multimodal distillation
     multimodal = GrillCheeseMultimodal(
@@ -208,19 +216,20 @@ def integrate_with_existing_system():
         )
         
         # Get emotional state from brain
-        emotion = brain.amygdala.get_current_emotion()
+        emotion = brain.amygdala.get_state()
         
         # Generate response with Phi-3
         response = phi3.generate(user_input, context=context)
+        embedding = phi3.get_embedding(response)
         
         # Update brain state
-        brain.process_interaction(user_input, response)
+        brain.process(user_input, embedding, context=context)
         
         # Distill knowledge (auto quality scoring)
         multimodal.process_interaction(
             user_msg=user_input,
             assistant_resp=response,
-            emotion_context=emotion
+            emotion_context=emotion.to_dict()
         )
         
         return response
@@ -231,7 +240,7 @@ def integrate_with_existing_system():
 
 if __name__ == "__main__":
     # Run basic example
-    example_usage()
+    #example_usage()
     
     # Uncomment to test integration
-    # integrate_with_existing_system()
+    integrate_with_existing_system()

@@ -4,6 +4,8 @@ STDP (Spike-Timing Dependent Plasticity) Learner for GrillCheese
 Implements bio-inspired learning based on temporal correlations between 
 embeddings. This strengthens associations between concepts that appear 
 together in conversations.
+
+GPU-accelerated using Vulkan compute shaders when available.
 """
 import json
 import logging
@@ -12,6 +14,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+# Try to import GPU backend
+try:
+    from vulkan_backend.vulkan_compute import VulkanCompute
+    GPU_AVAILABLE = True
+except ImportError:
+    GPU_AVAILABLE = False
 
 
 class STDPLearner:
@@ -36,7 +45,8 @@ class STDPLearner:
         time_window: int = 5,
         w_min: float = 0.0,
         w_max: float = 1.0,
-        decay: float = 0.99
+        decay: float = 0.99,
+        use_gpu: bool = True
     ):
         """
         Initialize STDP learner
@@ -48,7 +58,17 @@ class STDPLearner:
             w_min: Minimum weight
             w_max: Maximum weight
             decay: Passive decay factor for weights
+            use_gpu: Whether to use GPU acceleration when available
         """
+        self.use_gpu = use_gpu and GPU_AVAILABLE
+        self.gpu_backend = None
+        if self.use_gpu:
+            try:
+                self.gpu_backend = VulkanCompute()
+                logger.info("GPU acceleration enabled for STDP learning")
+            except Exception as e:
+                logger.warning(f"Failed to initialize GPU for STDP: {e}, using CPU")
+                self.use_gpu = False
         self.lr_plus = learning_rate_plus
         self.lr_minus = learning_rate_minus
         self.window = time_window
@@ -152,6 +172,8 @@ class STDPLearner:
         """
         Learn association between two embeddings (e.g., query and retrieved memory)
         
+        Uses GPU acceleration if available for large sequences.
+        
         Args:
             emb1_indices: Token indices from first embedding
             emb2_indices: Token indices from second embedding
@@ -160,6 +182,14 @@ class STDPLearner:
         Returns:
             Learning statistics
         """
+        # Try GPU batch processing if available and sequences are large enough
+        if self.use_gpu and self.gpu_backend is not None and len(emb1_indices) + len(emb2_indices) > 20:
+            try:
+                return self._process_pair_gpu(emb1_indices, emb2_indices, relevance)
+            except Exception as e:
+                logger.debug(f"GPU STDP failed: {e}, falling back to CPU")
+        
+        # CPU implementation (original)
         updates = 0
         
         # Cross-associate tokens from both embeddings
@@ -171,6 +201,87 @@ class STDPLearner:
                     updates += 1
         
         return {'updates': updates, 'relevance': relevance}
+    
+    def _process_pair_gpu(
+        self,
+        emb1_indices: List[int],
+        emb2_indices: List[int],
+        relevance: float = 1.0
+    ) -> Dict[str, Any]:
+        """
+        GPU-accelerated STDP processing for embedding pairs
+        
+        Converts token indices to spike sequences and uses GPU STDP shader.
+        """
+        if not self.use_gpu or self.gpu_backend is None:
+            raise RuntimeError("GPU backend not available")
+        
+        # Convert indices to spike sequences
+        # Create sparse activation matrices for GPU STDP
+        max_idx = max(max(emb1_indices, default=0), max(emb2_indices, default=0)) + 1
+        seq_len = max(len(emb1_indices), len(emb2_indices))
+        
+        # Create binary spike sequences (batch=1, time=seq_len, dim=max_idx)
+        pre_spikes = np.zeros((1, seq_len, max_idx), dtype=np.float32)
+        post_spikes = np.zeros((1, seq_len, max_idx), dtype=np.float32)
+        
+        # Set spikes at token positions
+        for t, idx in enumerate(emb1_indices[:seq_len]):
+            if idx < max_idx:
+                pre_spikes[0, t, idx] = 1.0
+        for t, idx in enumerate(emb2_indices[:seq_len]):
+            if idx < max_idx:
+                post_spikes[0, t, idx] = 1.0
+        
+        # Initialize weights if needed
+        if not hasattr(self, '_gpu_weights') or self._gpu_weights.shape[0] < max_idx:
+            old_size = self._gpu_weights.shape[0] if hasattr(self, '_gpu_weights') else 0
+            new_weights = np.zeros((max_idx, max_idx), dtype=np.float32)
+            if hasattr(self, '_gpu_weights'):
+                new_weights[:old_size, :old_size] = self._gpu_weights
+            self._gpu_weights = new_weights
+            self._gpu_pre_trace = np.zeros((1, max_idx), dtype=np.float32)
+            self._gpu_post_trace = np.zeros((1, max_idx), dtype=np.float32)
+        
+        # Use GPU STDP learning
+        try:
+            updated_weights, updated_pre_trace, updated_post_trace = self.gpu_backend.stdp_learning(
+                pre_activations=pre_spikes,
+                post_activations=post_spikes,
+                weights=self._gpu_weights,
+                pre_trace=self._gpu_pre_trace,
+                post_trace=self._gpu_post_trace,
+                lr_potentiation=self.lr_plus * relevance,
+                lr_depression=self.lr_minus,
+                trace_decay=0.9
+            )
+            
+            # Count updates (non-zero weight changes)
+            weight_changes = np.abs(updated_weights - self._gpu_weights)
+            updates = int(np.sum(weight_changes > 1e-6))
+            
+            # Update weights and traces
+            self._gpu_weights = updated_weights
+            self._gpu_pre_trace = updated_pre_trace
+            self._gpu_post_trace = updated_post_trace
+            
+            # Update token weights from GPU weights (for compatibility)
+            for i in range(max_idx):
+                for j in range(max_idx):
+                    if updated_weights[i, j] > 0:
+                        self.token_weights[i] = max(self.token_weights.get(i, 0), float(updated_weights[i, j]))
+                        if i != j:
+                            self._update_association(i, j, float(updated_weights[i, j]) * 0.1)
+            
+            return {
+                'updates': updates,
+                'relevance': relevance,
+                'gpu_accelerated': True
+            }
+        except Exception as e:
+            logger.debug(f"GPU STDP processing failed: {e}")
+            # Fall back to CPU
+            raise
     
     def _update_weight(self, token: int, delta: float) -> None:
         """Update token weight with bounds"""

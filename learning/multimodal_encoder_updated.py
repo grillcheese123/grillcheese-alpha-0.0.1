@@ -12,6 +12,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Import config for embedding model
+try:
+    from config import ModelConfig
+except ImportError:
+    # Fallback if config not available
+    ModelConfig = None
+
 class MultimodalEncoder:
     """Unified encoder for text, images, and audio using ONNX models"""
     
@@ -40,16 +47,25 @@ class MultimodalEncoder:
         else:
             self.providers = ['CPUExecutionProvider']
             
-    def load_text_encoder(self, model_path: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    def load_text_encoder(self, model_path: str = None):
         """
         Load text encoder - use sentence-transformers compatible model
         
+        Uses ModelConfig.EMBEDDING_MODEL if available, otherwise falls back to default.
         Options:
-        - all-MiniLM-L6-v2: 384-dim (MATCHES YOUR EXISTING CONFIG)
-        - LaBSE: 768-dim (requires config change)
+        - Granite-small (ibm-granite/granite-embedding-small-english-r2): 384-dim
+        - MXBAI-xsmall (mixedbread-ai/mxbai-embed-xsmall-v1): 384-dim
+        - all-MiniLM-L6-v2: 384-dim (fallback)
         """
         try:
             from sentence_transformers import SentenceTransformer
+            
+            # Use ModelConfig if available, otherwise use provided path or fallback
+            if model_path is None:
+                if ModelConfig and hasattr(ModelConfig, 'EMBEDDING_MODEL'):
+                    model_path = ModelConfig.EMBEDDING_MODEL
+                else:
+                    model_path = "sentence-transformers/all-MiniLM-L6-v2"
             
             # Load sentence-transformers model (auto-downloads)
             self.text_model = SentenceTransformer(model_path)

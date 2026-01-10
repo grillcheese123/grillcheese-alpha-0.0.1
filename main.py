@@ -14,10 +14,19 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import ServerConfig, MemoryConfig, SNNConfig, LogConfig, ModelConfig, find_gguf_model
+from config import ServerConfig, MemoryConfig, SNNConfig, LogConfig, ModelConfig, ModuleConfig, find_gguf_model
 from memory_store import MemoryStore
 from identity import DEFAULT_IDENTITY
 from vulkan_backend import SNNCompute
+
+# Module system imports
+try:
+    from modules.registry import ModuleRegistry
+    from modules.tools import ToolExecutor
+    MODULES_AVAILABLE = True
+except ImportError:
+    MODULES_AVAILABLE = False
+    logger.warning("Module system not available, using legacy initialization")
 
 # Configure logging
 logging.basicConfig(level=LogConfig.LEVEL, format=LogConfig.FORMAT)
@@ -76,29 +85,83 @@ memory = None
 snn = None
 brain = None
 learner = None
+registry = None
+tool_executor = None
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize model and components on startup"""
-    global phi3, memory, snn, brain, learner
+    global phi3, memory, snn, brain, learner, registry, tool_executor
     
     logger.info("Starting GrillCheese AI server...")
     
-    # Initialize model (try GGUF first, then PyTorch)
-    phi3 = _init_model()
-    
-    # Initialize memory store with correct embedding dimension (auto-detected)
-    embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
-    logger.info(f"Detected embedding dimension: {embedding_dim}")
-    logger.info(f"Initializing memory store (embedding_dim={embedding_dim})...")
-    memory = MemoryStore(
-        db_path=MemoryConfig.DB_PATH,
-        max_memories=MemoryConfig.MAX_MEMORIES,
-        embedding_dim=embedding_dim,
-        identity=DEFAULT_IDENTITY
-    )
-    logger.info(f"{LogConfig.CHECK} Memory store initialized")
+    # Initialize module system
+    if MODULES_AVAILABLE:
+        try:
+            logger.info("Loading modules...")
+            registry = ModuleRegistry()
+            registry.load_all_modules(
+                modules_dir=ModuleConfig.MODULES_DIR,
+                config_path=ModuleConfig.MODULES_CONFIG_FILE
+            )
+            
+            # Get model and memory from registry
+            phi3 = registry.get_active_model_provider()
+            memory_backend = registry.get_active_memory_backend()
+            
+            if memory_backend:
+                memory = memory_backend
+            else:
+                # Fallback to direct initialization
+                logger.warning("No memory backend found in registry, using legacy initialization")
+                phi3 = _init_model()
+                embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
+                memory = MemoryStore(
+                    db_path=MemoryConfig.DB_PATH,
+                    max_memories=MemoryConfig.MAX_MEMORIES,
+                    embedding_dim=embedding_dim,
+                    identity=DEFAULT_IDENTITY
+                )
+            
+            if not phi3:
+                # Fallback to direct initialization
+                logger.warning("No model provider found in registry, using legacy initialization")
+                phi3 = _init_model()
+            
+            # Initialize tool executor
+            tool_executor = ToolExecutor(registry)
+            
+            # Register API extensions
+            for extension in registry.api_extensions:
+                extension.register_routes(app)
+                extension.register_websockets(app)
+            
+            logger.info(f"{LogConfig.CHECK} Module system initialized")
+        except Exception as e:
+            logger.error(f"Module system initialization failed: {e}", exc_info=True)
+            logger.info("Falling back to legacy initialization")
+            phi3 = _init_model()
+            embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
+            memory = MemoryStore(
+                db_path=MemoryConfig.DB_PATH,
+                max_memories=MemoryConfig.MAX_MEMORIES,
+                embedding_dim=embedding_dim,
+                identity=DEFAULT_IDENTITY
+            )
+    else:
+        # Legacy initialization
+        phi3 = _init_model()
+        embedding_dim = ModelConfig.detect_embedding_dim(phi3) if phi3 else MemoryConfig.EMBEDDING_DIM
+        logger.info(f"Detected embedding dimension: {embedding_dim}")
+        logger.info(f"Initializing memory store (embedding_dim={embedding_dim})...")
+        memory = MemoryStore(
+            db_path=MemoryConfig.DB_PATH,
+            max_memories=MemoryConfig.MAX_MEMORIES,
+            embedding_dim=embedding_dim,
+            identity=DEFAULT_IDENTITY
+        )
+        logger.info(f"{LogConfig.CHECK} Memory store initialized")
     
     # Initialize SNN
     logger.info("Initializing SNN compute...")
@@ -112,7 +175,9 @@ async def startup_event():
             memory_store=memory,
             embedding_dim=embedding_dim,
             state_dir="brain_state",
-            use_gpu=True
+            use_gpu=True,
+            model=phi3,  # Pass model for reranking
+            enable_reranking=False  # Disabled for performance (reranking is computationally expensive)
         )
         
         # Check if affect prediction is calibrated
@@ -138,7 +203,11 @@ async def startup_event():
         logger.info(f"{LogConfig.CHECK} Continuous learning started")
     
     # Store system identity if not already stored
-    if memory.get_identity() and memory.identity_index == -1:
+    # Check if identity exists - handle both MemoryStore and plugin backends
+    identity_text = memory.get_identity()
+    identity_index = getattr(memory, 'identity_index', -1)
+    
+    if identity_text and identity_index == -1:
         logger.info("Storing system identity...")
         identity_emb = phi3.get_embedding(DEFAULT_IDENTITY)
         memory.store_identity(identity_emb, DEFAULT_IDENTITY)
@@ -220,14 +289,29 @@ async def websocket_endpoint(websocket: WebSocket):
 async def _process_prompt(prompt: str) -> dict:
     """Process a user prompt and return response data"""
     try:
+        # Request context for hooks
+        context_dict = {
+            "user_id": "default",
+            "session_id": "default"
+        }
+        
+        # Pre-process hooks
+        enhanced_prompt = prompt
+        if registry and registry.processing_hooks:
+            for hook in registry.processing_hooks:
+                try:
+                    enhanced_prompt = await hook.pre_process(enhanced_prompt, context_dict)
+                except Exception as e:
+                    logger.warning(f"Hook {hook.name} pre_process failed: {e}")
+        
         # Extract embedding
-        embedding = phi3.get_embedding(prompt)
+        embedding = phi3.get_embedding(enhanced_prompt)
         
         # Process through brain module (emotional intelligence)
         brain_result = None
         emotional_context = ""
         if brain is not None:
-            brain_result = brain.process(prompt, embedding)
+            brain_result = brain.process(enhanced_prompt, embedding)
             
             # Get empathy-aware prompt prefix
             emotional_context = brain.get_empathy_prompt()
@@ -236,19 +320,35 @@ async def _process_prompt(prompt: str) -> dict:
             response_style = brain.get_response_style()
         
         # Store in memory
-        memory.store(embedding, prompt)
+        memory.store(embedding, enhanced_prompt)
         
         # Retrieve similar memories (identity automatically included)
-        context = memory.retrieve(embedding, k=MemoryConfig.DEFAULT_K)
+        # Handle both MemoryStore API (returns List[str]) and plugin API (returns List[Tuple[str, float]])
+        retrieved = memory.retrieve(embedding, k=MemoryConfig.DEFAULT_K)
+        if retrieved and isinstance(retrieved[0], tuple):
+            # Plugin API: extract texts from tuples
+            context = [text for text, score in retrieved]
+        else:
+            # Legacy API: already List[str]
+            context = retrieved
         
         # Build enhanced prompt with emotional context
         if emotional_context:
-            enhanced_prompt = f"{emotional_context}\n\nUser: {prompt}"
+            final_prompt = f"{emotional_context}\n\nUser: {enhanced_prompt}"
         else:
-            enhanced_prompt = prompt
+            final_prompt = enhanced_prompt
         
-        # Generate response with context
-        response_text = phi3.generate(enhanced_prompt, context)
+        # Generate response with context (and tools if available)
+        if registry and tool_executor and registry.tools:
+            tools = registry.get_tools()
+            response_text = phi3.generate_with_tools(
+                final_prompt,
+                context,
+                tools=tools,
+                tool_executor=tool_executor
+            )
+        else:
+            response_text = phi3.generate(final_prompt, context)
         
         # Provide feedback to brain for learning
         if brain is not None and brain_result is not None:
@@ -285,6 +385,14 @@ async def _process_prompt(prompt: str) -> dict:
                 "spatial_context": brain_result.get('spatial_context', {}),
                 "modulation": brain_result['modulation']
             }
+        
+        # Post-process hooks
+        if registry and registry.processing_hooks:
+            for hook in registry.processing_hooks:
+                try:
+                    response_data = await hook.post_process(response_data, context_dict)
+                except Exception as e:
+                    logger.warning(f"Hook {hook.name} post_process failed: {e}")
         
         return response_data
         

@@ -48,9 +48,21 @@ class Phi3Model:
             device = "mps"
             logger.info(f"{LogConfig.CHECK} MPS (Apple Silicon) available")
         else:
-            device = "cpu"
-            logger.info(f"{LogConfig.WARNING} No GPU detected, using CPU")
-            logger.info("  Note: AMD GPU support requires ROCm or Vulkan shaders")
+            # Check for Vulkan availability (for AMD GPUs)
+            try:
+                from vulkan_backend.base import VULKAN_AVAILABLE
+                if VULKAN_AVAILABLE:
+                    device = "cpu"  # PyTorch can't use Vulkan directly
+                    logger.info(f"{LogConfig.WARNING} PyTorch model: No CUDA/MPS, using CPU")
+                    logger.info("  Note: For GPU acceleration, use GGUF model (llama.cpp supports Vulkan)")
+                else:
+                    device = "cpu"
+                    logger.info(f"{LogConfig.WARNING} No GPU detected, using CPU")
+                    logger.info("  Note: AMD GPU support requires ROCm or Vulkan shaders")
+            except ImportError:
+                device = "cpu"
+                logger.info(f"{LogConfig.WARNING} No GPU detected, using CPU")
+                logger.info("  Note: AMD GPU support requires ROCm or Vulkan shaders")
         return device
     
     def _load_model(self):
@@ -59,14 +71,14 @@ class Phi3Model:
             if self.device == "cuda":
                 model = AutoModelForCausalLM.from_pretrained(
                     "microsoft/Phi-3-mini-4k-instruct",
-                    torch_dtype=torch.float16,
+                    dtype=torch.float16,
                     device_map="auto"
                 )
                 logger.info(f"{LogConfig.CHECK} Model loaded on GPU")
             else:
                 model = AutoModelForCausalLM.from_pretrained(
                     "microsoft/Phi-3-mini-4k-instruct",
-                    torch_dtype=torch.float16,
+                    dtype=torch.float16,
                     device_map="cpu"
                 )
                 logger.info(f"{LogConfig.CHECK} Model loaded on CPU")
@@ -78,7 +90,7 @@ class Phi3Model:
                 self.device = "cpu"
                 return AutoModelForCausalLM.from_pretrained(
                     "microsoft/Phi-3-mini-4k-instruct",
-                    torch_dtype=torch.float16,
+                    dtype=torch.float16,
                     device_map="cpu"
                 )
             raise
@@ -130,14 +142,60 @@ class Phi3Model:
             Generated response text
         """
         try:
-            # Build prompt with context
-            context_items = context[:ModelConfig.MAX_CONTEXT_ITEMS] if context else []
-            context_text = "\n".join([f"Context: {c}" for c in context_items])
+            # Extract identity if present (should be first item)
+            identity_text = None
+            context_items = []
             
-            if context_text:
-                full_prompt = f"{context_text}\n\nUser: {prompt}\nAssistant:"
-            else:
-                full_prompt = f"User: {prompt}\nAssistant:"
+            if context:
+                # First item is typically identity
+                first_item = context[0]
+                # Check if it looks like identity (contains "GrillCheese" or is longer/descriptive)
+                if "GrillCheese" in first_item or len(first_item) > 200:
+                    identity_text = first_item
+                    context_items = context[1:ModelConfig.MAX_CONTEXT_ITEMS]
+                else:
+                    context_items = context[:ModelConfig.MAX_CONTEXT_ITEMS]
+            
+            # Build prompt with identity as system message
+            parts = []
+            
+            # Add identity as system message if present
+            if identity_text:
+                parts.append(f"<|system|>\n{identity_text}<|end|>\n")
+            
+            # Add other context items (recent conversation history and semantic memories)
+            if context_items:
+                # Format context more naturally
+                # Prioritize conversation history, then add semantic memories as optional background
+                context_lines = []
+                semantic_memories = []
+                
+                for c in context_items:
+                    # Check if it's conversation history (starts with "Previous")
+                    if c.startswith("Previous"):
+                        context_lines.append(c)
+                    else:
+                        # Semantic memory - collect separately
+                        semantic_memories.append(c)
+                
+                # Add conversation history first (most important for continuity)
+                if context_lines:
+                    context_text = "\n".join(context_lines)
+                    parts.append(context_text)
+                    parts.append("")
+                
+                # Add semantic memories as optional background (only if we have few enough)
+                if semantic_memories and len(semantic_memories) <= 2:
+                    # Only include 1-2 most relevant semantic memories to avoid confusion
+                    background_text = "\n".join([f"Background: {m}" for m in semantic_memories[:2]])
+                    parts.append(background_text)
+                    parts.append("")
+            
+            # Add user prompt
+            parts.append(f"<|user|>\n{prompt}<|end|>\n")
+            parts.append("<|assistant|>\n")
+            
+            full_prompt = "\n".join(parts)
             
             # Tokenize
             inputs = self.tokenizer(

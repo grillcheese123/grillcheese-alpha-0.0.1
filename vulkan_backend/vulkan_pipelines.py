@@ -19,6 +19,8 @@ class VulkanPipelines:
         self.pipeline_layouts = {}
         # Descriptor set caching to prevent pool exhaustion
         self.descriptor_set_cache = {}
+        self.cache_access_order = []  # LRU tracking
+        self.max_cache_size = 100  # Limit cache to prevent pool exhaustion
         self.cache_hits = 0
         self.cache_misses = 0
     
@@ -96,10 +98,20 @@ class VulkanPipelines:
         """
         Get or create a pipeline for a shader.
         
+        Raises:
+            KeyError: If shader is not found in shaders dictionary
+        
         Returns:
             Tuple of (pipeline, pipeline_layout, descriptor_set_layout)
         """
         if shader_name not in self.pipelines:
+            # Check if shader exists
+            if shader_name not in self.core.shaders:
+                raise KeyError(
+                    f"Shader '{shader_name}' not found. "
+                    f"Compile with: glslc shaders/{shader_name}.glsl -o shaders/spv/{shader_name}.spv"
+                )
+            
             desc_layout = self._create_descriptor_set_layout(num_buffers)
             pipe_layout = self._create_pipeline_layout(desc_layout, push_constant_size)
             pipeline = self._create_compute_pipeline(
@@ -155,6 +167,7 @@ class VulkanPipelines:
     def get_cached_descriptor_set(self, shader_name: str, buffers: list):
         """
         Get a cached descriptor set or create a new one.
+        Implements LRU eviction to prevent descriptor pool exhaustion.
         
         Args:
             shader_name: Name of the shader
@@ -170,6 +183,11 @@ class VulkanPipelines:
         # Check cache
         if cache_key in self.descriptor_set_cache:
             cached_set = self.descriptor_set_cache[cache_key]
+            # Update LRU order (move to end)
+            if cache_key in self.cache_access_order:
+                self.cache_access_order.remove(cache_key)
+            self.cache_access_order.append(cache_key)
+            
             # Update buffer bindings for the cached set
             writes = []
             for i, (buffer, size) in enumerate(buffers):
@@ -192,7 +210,21 @@ class VulkanPipelines:
             self.cache_hits += 1
             return cached_set
         
-        # Cache miss - create new descriptor set
+        # Cache miss - need to create new descriptor set
+        # First, evict LRU entries if cache is full
+        while len(self.descriptor_set_cache) >= self.max_cache_size:
+            if not self.cache_access_order:
+                break
+            lru_key = self.cache_access_order.pop(0)
+            lru_set = self.descriptor_set_cache.pop(lru_key)
+            # Free the descriptor set back to the pool
+            try:
+                vkFreeDescriptorSets(self.core.device, self.core.descriptor_pool, 1, [lru_set])
+            except Exception as e:
+                # Ignore errors during cleanup (pool might be fragmented)
+                pass
+        
+        # Get or create descriptor set layout
         desc_layout = self.descriptor_set_layouts.get(shader_name)
         if desc_layout is None:
             # Get layout from pipeline if available
@@ -203,8 +235,20 @@ class VulkanPipelines:
                 desc_layout = self._create_descriptor_set_layout(len(buffers))
                 self.descriptor_set_layouts[shader_name] = desc_layout
         
-        descriptor_set = self._create_descriptor_set(desc_layout, buffers)
+        # Create new descriptor set
+        try:
+            descriptor_set = self._create_descriptor_set(desc_layout, buffers)
+        except Exception as e:
+            # If allocation fails, try clearing cache and retry once
+            if "OUT_OF_POOL_MEMORY" in str(e) or e == -1000069000:
+                self.clear_descriptor_cache()
+                descriptor_set = self._create_descriptor_set(desc_layout, buffers)
+            else:
+                raise
+        
+        # Add to cache
         self.descriptor_set_cache[cache_key] = descriptor_set
+        self.cache_access_order.append(cache_key)
         self.cache_misses += 1
         
         return descriptor_set
@@ -219,6 +263,7 @@ class VulkanPipelines:
             'cache_misses': self.cache_misses,
             'hit_rate': hit_rate,
             'cached_sets': len(self.descriptor_set_cache),
+            'max_cache_size': self.max_cache_size,
             'max_pool_size': 500
         }
     
@@ -226,8 +271,13 @@ class VulkanPipelines:
         """Clear all cached descriptor sets"""
         if hasattr(self.core, 'device') and self.core.device:
             for desc_set in self.descriptor_set_cache.values():
-                vkFreeDescriptorSets(self.core.device, self.core.descriptor_pool, 1, [desc_set])
+                try:
+                    vkFreeDescriptorSets(self.core.device, self.core.descriptor_pool, 1, [desc_set])
+                except Exception:
+                    # Ignore errors during cleanup
+                    pass
         self.descriptor_set_cache.clear()
+        self.cache_access_order.clear()
         self.cache_hits = 0
         self.cache_misses = 0
     

@@ -17,9 +17,21 @@ class ModelConfig:
     PHI3_EMBEDDING_DIM = 3072
     
     # Sentence-transformers embedding dimension (for GGUF fallback)
-    # all-MiniLM-L6-v2: 384 dims, fast, good quality
+    # all-MiniLM-L6-v2: 384 dims, fast, good quality (legacy)
     # all-mpnet-base-v2: 768 dims, better quality, slower
-    SENTENCE_TRANSFORMER_MODEL = "all-MiniLM-L6-v2"
+    # ibm-granite/granite-embedding-small-english-r2: 384 dims, 47M params, 8k context (balanced)
+    # mixedbread-ai/mxbai-embed-xsmall-v1: 384 dims, ~22.7M params, 4k context (ultra-light)
+    
+    # Embedding configuration
+    # Set USE_EMBEDDINGS=False to disable sentence-transformers entirely (prevents crashes)
+    USE_EMBEDDINGS = True  # Enabled - using Granite embeddings
+    
+    # Embedding model: Granite (ibm-granite/granite-embedding-small-english-r2)
+    # 384 dims, 47M params, 8k context - balanced quality and performance
+    EMBEDDING_MODEL = "ibm-granite/granite-embedding-small-english-r2"
+    
+    # Legacy support
+    SENTENCE_TRANSFORMER_MODEL = "ibm-granite/granite-embedding-small-english-r2"  # Fallback if new model fails
     SENTENCE_TRANSFORMER_DIM = 384
     
     # Which embedding dimension to use (defaults to sentence-transformer for compatibility)
@@ -65,7 +77,7 @@ class ModelConfig:
 # Memory configuration
 class MemoryConfig:
     DB_PATH = "memories.db"
-    MAX_MEMORIES = 100000
+    MAX_MEMORIES = 1000000
     EMBEDDING_DIM = ModelConfig.EMBEDDING_DIM
     
     # Top-K retrieval default
@@ -73,6 +85,18 @@ class MemoryConfig:
     
     # GPU memory buffer size (number of embeddings to keep in GPU memory)
     GPU_BUFFER_SIZE = 10000
+    
+    # Hilbert Multiverse Routing (experimental)
+    # When enabled, uses complex-valued embeddings for 0.875 semantic correlation
+    # vs 0.591 baseline. Can be toggled via CLI flag --hilbert
+    USE_HILBERT_ROUTING = False
+    HILBERT_UNIVERSE = "neutral"  # Options: neutral, analytical, creative, empathetic, etc.
+    
+    # Capsule Memory System (experimental)
+    # When enabled, uses bio-inspired 32D capsule memory with hippocampal architecture
+    USE_CAPSULE_MEMORY = True
+    CAPSULE_MEMORY_CAPACITY = 100000
+    CAPSULE_IDENTITY_PATH = BASE_DIR / "data" / "identity" / "capsule.jsonl"
 
 
 # SNN configuration
@@ -86,7 +110,7 @@ class SNNConfig:
     
     # Simulation settings
     TIMESTEPS = 50      # Number of timesteps per forward pass
-    INPUT_SCALE = 20.0  # Scaling factor for input embeddings
+    INPUT_SCALE = 25.0  # Scaling factor for input embeddings
 
 
 # Server configuration
@@ -105,6 +129,16 @@ class LogConfig:
     CHECK = "[OK]"
     CROSS = "[X]"
     WARNING = "[!]"
+
+
+# Module configuration
+class ModuleConfig:
+    """Configuration for plugin/module system"""
+    MODULES_DIR = BASE_DIR / "modules"
+    MODULES_CONFIG_FILE = MODULES_DIR / "modules_config.json"
+    AUTO_DISCOVER = True
+    DEFAULT_MEMORY_BACKEND = "sqlite_faiss"  # or plugin name
+    DEFAULT_MODEL_PROVIDER = "gguf"  # or plugin name
 
 
 # Helper function to find GGUF model

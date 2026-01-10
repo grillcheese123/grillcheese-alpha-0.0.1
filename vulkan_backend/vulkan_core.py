@@ -14,9 +14,13 @@ if VULKAN_AVAILABLE:
 class VulkanCore:
     """Core Vulkan operations: initialization, buffers, and dispatch"""
     
-    def __init__(self, shader_dir: str = "shaders"):
+    def __init__(self, shader_dir: str = None):
         if not VULKAN_AVAILABLE:
             raise RuntimeError("Vulkan not available")
+        
+        # Default to shaders directory relative to this file
+        if shader_dir is None:
+            shader_dir = Path(__file__).parent.parent / "shaders"
         
         self.shader_dir = Path(shader_dir)
         self.shaders = self._load_shaders()
@@ -36,6 +40,14 @@ class VulkanCore:
             name = spv_file.stem
             with open(spv_file, 'rb') as f:
                 shaders[name] = f.read()
+        
+        # Check for missing shaders and warn
+        required_shaders = ['fnn-xavier-init']
+        for shader_name in required_shaders:
+            if shader_name not in shaders:
+                print(f"[WARNING] Shader {shader_name}.spv not found - GPU Xavier init will use CPU fallback")
+                print(f"  To compile: glslc {shader_name}.glsl -o spv/{shader_name}.spv")
+        
         return shaders
     
     def _init_vulkan(self):
@@ -61,9 +73,17 @@ class VulkanCore:
         physical_devices = vkEnumeratePhysicalDevices(self.instance)
         self.physical_device = self._select_gpu(physical_devices)
         
-        # Get device properties
+        # Get device properties and features
         props = vkGetPhysicalDeviceProperties(self.physical_device)
+        features = vkGetPhysicalDeviceFeatures(self.physical_device)
         print(f"[OK] Using GPU: {props.deviceName}")
+        
+        # Store device properties and features for capability queries
+        self.device_properties = props
+        self.device_features = features
+        
+        # Check for tiling-related capabilities
+        self.tiling_support = self._check_tiling_support()
         
         # Find compute queue family
         queue_families = vkGetPhysicalDeviceQueueFamilyProperties(self.physical_device)
@@ -84,10 +104,22 @@ class VulkanCore:
             pQueuePriorities=[1.0]
         )
         
+        # Request sparse features if available (for tiling support)
+        device_features = VkPhysicalDeviceFeatures()
+        try:
+            # Try to enable sparse features for tiling
+            if hasattr(self.device_features, 'sparseBinding'):
+                device_features.sparseBinding = self.device_features.sparseBinding
+            if hasattr(self.device_features, 'sparseResidencyBuffer'):
+                device_features.sparseResidencyBuffer = self.device_features.sparseResidencyBuffer
+        except:
+            pass
+        
         device_create_info = VkDeviceCreateInfo(
             sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             queueCreateInfoCount=1,
-            pQueueCreateInfos=[queue_create_info]
+            pQueueCreateInfos=[queue_create_info],
+            pEnabledFeatures=device_features
         )
         
         self.device = vkCreateDevice(self.physical_device, device_create_info, None)
@@ -130,6 +162,76 @@ class VulkanCore:
             if 'AMD' in name or 'Radeon' in name:
                 return device
         return devices[0]
+    
+    def _check_tiling_support(self) -> dict:
+        """
+        Check for tiling-related GPU capabilities
+        
+        Returns:
+            Dictionary with tiling support information:
+            - sparse_binding: Sparse buffer/image binding support
+            - sparse_residency: Sparse residency support
+            - sparse_residency_aliased: Aliased sparse residency
+            - optimal_tiling: Optimal image tiling support (always True for modern GPUs)
+            - shader_image_gather_extended: Extended image gather (tiling-friendly)
+            - device_name: GPU name
+            - vendor_id: Vendor ID (AMD=0x1002, NVIDIA=0x10DE, Intel=0x8086)
+        """
+        if not VULKAN_AVAILABLE:
+            return {'available': False}
+        
+        try:
+            features = self.device_features
+            props = self.device_properties
+            
+            tiling_info = {
+                'available': True,
+                'sparse_binding': getattr(features, 'sparseBinding', False),
+                'sparse_residency': getattr(features, 'sparseResidencyBuffer', False),
+                'sparse_residency_aliased': getattr(features, 'sparseResidencyAliased', False),
+                'shader_image_gather_extended': getattr(features, 'shaderImageGatherExtended', False),
+                'device_name': props.deviceName.decode('utf-8') if isinstance(props.deviceName, bytes) else props.deviceName,
+                'vendor_id': props.vendorID,
+                'device_type': props.deviceType,
+                'optimal_tiling': True,  # All modern GPUs support optimal tiling
+            }
+            
+            # Check for vendor-specific tiling features
+            vendor_name = "Unknown"
+            if props.vendorID == 0x1002:
+                vendor_name = "AMD"
+                # AMD GPUs typically have good tiling support
+                tiling_info['amd_optimized'] = True
+            elif props.vendorID == 0x10DE:
+                vendor_name = "NVIDIA"
+                # NVIDIA GPUs have excellent tiling support
+                tiling_info['nvidia_optimized'] = True
+            elif props.vendorID == 0x8086:
+                vendor_name = "Intel"
+                tiling_info['intel_optimized'] = True
+            
+            tiling_info['vendor'] = vendor_name
+            
+            # Log tiling capabilities
+            if tiling_info['sparse_binding']:
+                print(f"[OK] Tiling support: Sparse binding enabled")
+            if tiling_info['sparse_residency']:
+                print(f"[OK] Tiling support: Sparse residency enabled")
+            
+            return tiling_info
+            
+        except Exception as e:
+            print(f"[WARNING] Failed to check tiling support: {e}")
+            return {'available': False, 'error': str(e)}
+    
+    def get_tiling_info(self) -> dict:
+        """
+        Get tiling support information
+        
+        Returns:
+            Dictionary with tiling capabilities
+        """
+        return getattr(self, 'tiling_support', {'available': False})
     
     def _create_buffer(self, size: int, usage: int):
         """Create Vulkan buffer and allocate memory"""
