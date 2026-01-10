@@ -1,164 +1,168 @@
-# GrillCheese AI: Vulkan Capsule Memory System
+# GrillCheese AI: Capsule Memory System
 
-## Complete Architecture
+## Architecture
 
 ```
-User Input
-    |
-    v
-[VulkanCapsuleTransformer]
-    |
-    +---> encode() --> 384D Embedding
-    |
-    +---> encode_to_capsule() --> 32D Capsule
-    |         |
-    |         +-- 28D: Semantic content (projected from 384D)
-    |         +-- 4D: Cognitive features (plasticity, consolidation, stability, stress)
-    |
-    +---> DentateGyrus.expand() --> 128D Sparse (2% active)
-              |
-              v
-[CA3MemoryStore / FAISS Index]
-              |
-              +-- add_memory() --> Store with DG vector
-              +-- query() --> kNN retrieval
-              |
-              v
-Retrieved Memories
-              |
-              v
-[Memory Injection at Layers 4-5]
-              |
-              v
-Output Embedding (with memory context)
+User Query
+    │
+    ▼
+┌─────────────────────────────────────┐
+│  VulkanCapsuleTransformer           │
+│  ┌───────────────────────────────┐  │
+│  │ 1. Tokenize (SentencePiece)   │  │
+│  │ 2. Token Embeddings           │  │
+│  │ 3. 6x Transformer Layers      │  │
+│  │    └─ Memory Injection @4-5   │◄─┼── Retrieved Memories
+│  │ 4. Pooling (mean)             │  │
+│  │ 5. Capsule Projection 384→32D │  │
+│  │ 6. DG Expansion 32→128D (2%)  │  │
+│  └───────────────────────────────┘  │
+└─────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────┐
+│  CA3MemoryStore (FAISS/numpy)       │
+│  • Add: Store with DG vector        │
+│  • Query: kNN retrieval             │
+│  • Consolidate: Importance-based    │
+└─────────────────────────────────────┘
 ```
 
-## Files Created
+## 32D Capsule Structure
 
-### Core Modules
-
-| File | Purpose |
-|------|---------|
-| `vulkan_capsule_transformer.py` | Main transformer with RoPE, capsule encoding, DG, injection |
-| `ca3_memory_store.py` | FAISS-backed memory store with CA3 pattern completion |
-| `tokenizer.py` | SentencePiece tokenizer with byte-level fallback |
-
-### Shaders (GPU-accelerated)
-
-| Shader | Function |
-|--------|----------|
-| `rope.glsl` | Rotary Position Embeddings |
-| `flash-attention2-rope.glsl` | Flash Attention 2 with fused RoPE |
-| `embedding-pool.glsl` | Mean/CLS/Max pooling |
-| `embedding-ffn.glsl` | Feed-forward network with GELU |
-| `embedding-normalize.glsl` | L2 normalization |
-| `capsule-project.glsl` | 384D → 32D projection with cognitive features |
-| `dg-sparse-expand.glsl` | 32D → 128D sparse DG expansion |
-| `memory-inject-residual.glsl` | Memory injection into residual stream |
-
-### Testing & Validation
-
-| File | Purpose |
-|------|---------|
-| `empirical_tests.py` | 7 validation tests for architecture |
-| `test_integration.py` | Full pipeline integration test |
-| `EMPIRICAL_VALIDATION_REPORT.md` | Detailed test results analysis |
-
-## Key Metrics (Empirical Validation)
-
-| Feature | Improvement | Description |
-|---------|-------------|-------------|
-| DG Sparsity (2%) | **+130.5%** | Pattern separation vs 10% sparsity |
-| Cognitive Features | **+48.2%** | Inter/intra class clustering |
-| Pattern Separation | **+46.7%** | Overlap reduction (96% → 51%) |
-| Retrieval Accuracy | **+68.4%** | Domain accuracy vs random |
-| Capsule Compression | 12x | 384D → 32D with 67% rank correlation |
-
-## Usage Examples
-
-### Basic Encoding
-```python
-from vulkan_capsule_transformer import VulkanCapsuleTransformer
-
-encoder = VulkanCapsuleTransformer()
-embedding = encoder.encode("Hello world")  # (384,)
-capsule = encoder.encode_to_capsule("Hello world")  # (32,)
 ```
-
-### Memory Creation
-```python
-from vulkan_capsule_transformer import CapsuleMemory, MemoryType, CognitiveFeatures
-
-memory = encoder.create_memory(
-    content="Pattern separation prevents interference",
-    memory_type=MemoryType.CONCEPT,
-    domain="neuroscience",
-    cognitive_features=CognitiveFeatures(
-        plasticity_gain=0.8,
-        stability=0.9
-    )
-)
-# memory.capsule_vector: (32,)
-# memory.dg_vector: (128,) sparse
-```
-
-### Memory Store
-```python
-from ca3_memory_store import CA3MemoryStore
-
-store = CA3MemoryStore(encoder, capacity=100000)
-store.add_memory(memory)
-
-# Query
-results = store.query("How does memory work?", k=10)
-for mem, distance in results:
-    print(f"{mem.domain}: {mem.content[:50]}... (dist={distance:.3f})")
-```
-
-### Forward with Memory Injection
-```python
-# Retrieve relevant memories
-retrieved = store.query("Tell me about yourself", k=5)
-memories_to_inject = [mem for mem, _ in retrieved]
-
-# Forward pass with injection at layers 4-5
-embedding = encoder.forward(
-    input_ids, 
-    attention_mask,
-    inject_memories=memories_to_inject
-)
+┌────────────────────────────────────────────┐
+│ Dims 0-27: Semantic Content (projected)    │
+├────────────────────────────────────────────┤
+│ Dim 28: plasticity_gain (learning rate)    │
+│ Dim 29: consolidation_priority (replay)    │
+│ Dim 30: stability (forgetting resistance)  │
+│ Dim 31: stress_link (emotional tag)        │
+└────────────────────────────────────────────┘
 ```
 
 ## Performance
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| Forward pass (CPU) | ~80-160ms | 384D embedding |
-| Forward + injection | ~90-170ms | +10ms overhead |
-| Capsule encoding | ~1100ms | Includes forward pass |
-| DG expansion | ~1ms | CPU numpy |
-| Memory retrieval | ~320ms avg | Dominated by encoding |
-| FAISS search | <5ms | At 100K memories |
+| **Text Encoding** | ~1100-1300ms | Bottleneck (CPU forward) |
+| Forward Pass (CPU) | 80-160ms | 6 layers, 384D |
+| FAISS Search | <1ms | Numpy, 7 memories |
+| FAISS Search | ~34ms | Numpy, 100K memories |
+| Memory Injection | +10ms | Residual addition |
+| DG Expansion | <1ms | Sparse projection |
 
-## Architecture Decisions Validated
+### Bottleneck Analysis
 
-1. **32D Capsules**: Preserve 67% semantic ranking at 12x compression
-2. **2% DG Sparsity**: 130% better pattern separation than dense
-3. **4 Cognitive Dims**: Enable context-aware memory clustering
-4. **Layers 4-5 Injection**: Optimal semantic blending point
-5. **Bio-inspired Design**: Matches hippocampal DG-CA3-CA1 pathway
+The main bottleneck is **text encoding** (~1.1s), which includes:
+1. Tokenization: ~5ms
+2. Forward pass: ~80-160ms × 1 (but includes Python overhead)
+3. Full pipeline overhead
 
-## Next Steps
+**Solution**: GPU-accelerated forward pass (in progress)
 
-1. **Install FAISS-GPU** for faster retrieval
-2. **Train projection matrix** on domain-specific data
-3. **Optimize GPU path** with persistent buffers
-4. **Integrate with Phi-3** for full generation pipeline
-5. **Add memory consolidation** replay during idle time
+## Files
+
+### Core Modules
+| File | Lines | Description |
+|------|-------|-------------|
+| `vulkan_capsule_transformer.py` | ~1050 | RoPE transformer, capsule encoding, DG, injection |
+| `ca3_memory_store.py` | ~650 | FAISS/numpy memory store with consolidation |
+| `tokenizer.py` | ~200 | SentencePiece with byte-level fallback |
+
+### Shaders (93 total, GPU compute)
+| Shader | Purpose |
+|--------|---------|
+| `rope.glsl` | Rotary Position Embeddings |
+| `flash-attention2-rope.glsl` | Flash Attention 2 + RoPE |
+| `capsule-project.glsl` | 384D→32D + cognitive features |
+| `dg-sparse-expand.glsl` | 32D→128D sparse (2% active) |
+| `memory-inject-residual.glsl` | Inject to layers 4-5 |
+| `faiss-distance.glsl` | L2/cosine/dot distances |
+| `faiss-topk.glsl` | Top-k selection |
+
+## Empirical Validation
+
+| Test | Result | Significance |
+|------|--------|--------------|
+| DG Sparsity (2%) | **+130.5%** | Pattern separation vs dense |
+| Cognitive Features | **+48.2%** | Inter/intra cluster ratio |
+| Pattern Separation | **+46.7%** | Overlap reduction |
+| Retrieval Accuracy | **+68.4%** | Domain accuracy vs random |
+| Capsule Compression | 12x | 384D→32D, 67% correlation |
+
+## Usage
+
+### Quick Start
+```python
+from vulkan_capsule_transformer import VulkanCapsuleTransformer
+from ca3_memory_store import CA3MemoryStore
+
+# Initialize
+encoder = VulkanCapsuleTransformer()
+store = CA3MemoryStore(encoder, capacity=100000)
+
+# Add memory
+from vulkan_capsule_transformer import CapsuleMemory, MemoryType, CognitiveFeatures
+
+memory = encoder.create_memory(
+    content="I am GrillCheese AI",
+    memory_type=MemoryType.SELF_STATE,
+    domain="identity",
+    cognitive_features=CognitiveFeatures(stability=0.95),
+    protected=True
+)
+store.add_memory(memory)
+
+# Query
+results = store.query("What AI am I?", k=5)
+for mem, dist in results:
+    print(f"{mem.domain}: {mem.content[:50]}...")
+```
+
+### Memory Injection
+```python
+# Retrieve relevant memories
+retrieved = store.query("Tell me about your architecture", k=5)
+memories = [mem for mem, _ in retrieved]
+
+# Encode with injection at layers 4-5
+encoded = encoder.tokenizer.encode("Tell me about your architecture")
+embedding = encoder.forward(
+    encoded['input_ids'].reshape(1, -1),
+    encoded['attention_mask'].reshape(1, -1),
+    inject_memories=memories
+)
+```
+
+### Persistence
+```python
+store.save("memories.json")
+store.load("memories.json")
+```
+
+## Optimization Roadmap
+
+### Phase 1: GPU Forward Pass (Next)
+- Persistent GPU buffers for weights
+- Chain shader dispatches without CPU readback
+- Expected: 80-160ms → 15-25ms
+
+### Phase 2: Batch Encoding
+- Batch multiple texts in single forward pass
+- Amortize GPU dispatch overhead
+- Expected: 10ms/text in batch
+
+### Phase 3: FAISS Shader Optimization
+- Parallel reduction for topk
+- Tiled matrix multiplication for distances
+- Expected: Beat numpy at >50K vectors
 
 ## Dependencies
 
-- numpy
-- vulkan (via vulkan-python)
-- sentencepiece (optional, for tokenizer)
-- faiss-cpu or faiss-gpu (optional, numpy fallback available)
+```
+numpy
+vulkan (via vulkan-python)
+sentencepiece (optional)
+faiss-cpu (optional, numpy fallback available)
+```
